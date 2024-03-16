@@ -74,6 +74,15 @@ Examples:
 --ignore-ranges '[[0,5000],[10000,12000]]'
 ```
 
+`--gs-cache`
+
+When specified, `dumbhfdl.py` will write out a JSON file with the same structure as the Airframes.io ground station endpoint. It will try to use this file to rebuild the ground station list when started and Airframes is not available. This eliminates the need to build the list up from squitters every time. See also the `DUMPHFDL_AIRFRAMES_CACHE` environment variable.
+
+Example:
+```
+--gs-cache /tmp/ground-stations.json
+```
+
 ### `run` Specific
 
 Many of these options are passed through to `dumphfdl`. Others are used to configure other `dumphfdl` parameters.
@@ -179,6 +188,7 @@ DUMPHFDL_SYSTABLE='/usr/local/share/dumphfdl/systable.conf'
 DUMPHFDL_STATION_ID='MY-XYZA1-HFDL'
 DUMPHFDL_STATSD='stats.example:8125'
 DUMPHFDL_ACARS_HUB='localhost:5556'
+DUMPHFDL_AIRFRAMES_CACHE=/tmp/ground-stations.json
 ```
 
 ### Tip
@@ -193,7 +203,7 @@ The parentheses are necessary as that makes the whole line a sub-shell. When it 
 
 ## Theory of Operation
 
-HFDL operates on a variety of frequencies in the HF band (1.6 - 30MHz). The ideal frequencies for both aircraft and ground stations changes depending on time of day and geomagnetic conditions. The general trend can be predicted, but specifics are always variable. The HFDL system itself provides an internal management mechanism that coordinates frequency assignments between ground stations. We do not have access to that system. However, planes also need to know what frequencies to use, so every ground station broadcasts a (partial) list of active frequencies of the HFDL system at the start of each 32 second frame. These "squitters" can be aggregated over several frames to provide a complete list of operating frequencies that changes as conditions change. [Airframes](https://airframes.io) provides an [API endpoint](https://api.airframes.io/hfdl/ground-stations) that has the latest aggregated list available.
+HFDL operates on a variety of frequencies in the HF band (1.6 - 30MHz). The ideal frequencies for both aircraft and ground stations changes depending on time of day and geomagnetic conditions. The general trend can be predicted, but specifics are always variable. The HFDL system itself provides an internal management mechanism that coordinates frequency assignments between ground stations. We do not have access to that system. However, planes also need to know what frequencies to use, so every ground station broadcasts a (partial) list of active frequencies of the HFDL system at the start of each 32 second frame. These "squitters" can be aggregated over several frames to provide a complete list of operating frequencies that changes as conditions change. [Airframes](https://airframes.io) provides an [API endpoint](https://api.airframes.io/hfdl/ground-stations) that has the latest aggregated list available. `dumbhfdl.py` will keep and update its own copy of this file if the `--gs-cache` option (or env var) is set.
 
 ### Why is this important?
 

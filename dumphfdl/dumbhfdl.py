@@ -6,6 +6,7 @@
 # system libraries
 import asyncio.subprocess
 import bisect
+import datetime
 import functools
 import itertools
 import json
@@ -32,6 +33,8 @@ FILTER_FACTOR = 0.8
 
 # The URL to retrieve Ground Station from
 GROUND_STATION_URL = 'https://api.airframes.io/hfdl/ground-stations'
+# How long to cache ground station updates (seconds)
+GS_EXPIRY = 4 * 3600
 #
 # How often (seconds) to update the frequency list (and probably restart dumphfdl)
 # Set with `--watch-interval` on command line or environment variable `DUMPHFDL_WATCH_INTERVAL`)
@@ -80,7 +83,8 @@ class GroundStationWatcher:
     watch_interval = 600
     _max_sample_size = 20000
 
-    def __init__(self, on_update=None):
+    def __init__(self, ground_stations, on_update=None):
+        self.ground_stations = ground_stations
         self.active_stations = {}
         self.task = None
         self.on_update = on_update
@@ -105,7 +109,7 @@ class GroundStationWatcher:
             self.refresh()
             await asyncio.sleep(self.watch_interval)
 
-    def stop(self):
+    def stop(self) -> None:
         if self.task:
             self.task.cancel()
             self.task = None
@@ -145,10 +149,10 @@ class GroundStationWatcher:
         if sum(len(f) for f in self.active_stations.values()) == 0:
             print('no valid working stations detected')
             # attempt to use the actively detected frequencies, but only if all core stations are available.
-            if all(core_id in GROUND_STATION_DATA for core_id in self.core_ids):
+            if all(core_id in self.ground_stations for core_id in self.core_ids):
                 # There's no expiry, so in pathological cases, this *could* get out of date. Ugh. Ignore for now.
                 print("using ground_station_updater update frequency list")
-                self.active_stations = GROUND_STATION_DATA
+                self.load_active_stations(self.ground_stations.dict())
             elif self.last:
                 # This could also get out of date. Also ignoring that for now.
                 print("reusing results of previous scan")
@@ -248,7 +252,99 @@ class GroundStationWatcher:
             print('===')
 
 
-GROUND_STATION_DATA = {}
+class GroundStations:
+    def __init__(self, path=None):
+        self.stations_by_id = {}
+        self.name_lookup = {}
+        self.path = pathlib.Path(path)
+        self.last = None
+        if (self.path):
+            self.load()
+
+    def load(self):
+        if self.path and self.path.exists():
+            s = self.path.read_text()
+            if s:
+                self.last = json.loads(s)
+                self.merge_airframes(self.last)
+
+    def save(self):
+        if self.path:
+            current = json.dumps(self.dict(), indent=4)
+            if current != self.last:  # very naive
+                self.path.write_text(current)
+                self.last = current
+
+    def update_lookups(self):
+        self.name_lookup = {gs['name']: gs for gs in self.stations_by_id.values()}
+
+    def merge_station(self, station):
+        try:
+            gs = self[station['id']]
+        except KeyError:
+            self.stations_by_id[gs['id']] = gs
+        else:
+            if gs['last_updated'] > station['last_updated']:
+                station.update(gs)
+        self.update_lookups()
+
+    def prune_expired(self):
+        now = datetime.datetime.now().timestamp()
+        horizon = now - GS_EXPIRY
+        for gs in list(self.stations_by_id.values()):
+            if gs['last_updated'] < horizon:
+                del self.stations_by_id[gs['id']]
+
+    def merge_squitter(self, squitter):
+        base = squitter.get('hfdl', {}).get('spdu', {}).get('gs_status', [])
+        last_updated = squitter.get('hfdl', {}).get('t', {}).get('sec', 0)
+        ground_stations = []
+        for station in base:
+            freqs = sorted(map(int, (sf['freq'] for sf in station['freqs'])))
+            gs = {
+                'id': station['gs']['id'],
+                'name': station['gs']['name'],
+                'frequencies': {
+                    'active': freqs,
+                },
+                'last_updated': last_updated
+            }
+            self.merge_station(gs)
+        self.prune_expired()
+        self.save()
+
+    def merge_airframes(self, airframes):
+        for gs in airframes.get('ground_stations', []):
+            gs['frequencies']['active'] = sorted(map(int, gs['frequencies'].get("active", [])))
+            self.merge_station(gs)
+        self.prune_expired()
+        self.save()
+
+    def dict(self):
+        return {'ground_stations': list(self.stations_by_id.values())}
+
+    MISSING = object()
+    def __getitem__(self, key):
+        try:
+            gsid = int(key)
+        except ValueError:
+            gsid = key
+            lookup = self.stations_by_id
+        else:
+            lookup = self.name_lookup
+        try:
+            return lookup[key]
+        except AttributeError:
+            if default is not MISSING:
+                return default
+            raise
+
+    def __contains__(self, key):
+        try:
+            return int(key) in self.stations_by_id
+        except ValueError:
+            pass
+        return key in self.name_lookup
 
 
 class SquitterWatcher:
@@ -272,17 +368,10 @@ class SquitterWatcher:
                     continue
                 if '"gs_status"' in line:
                     data = json.loads(line)
-                    update = {}
-                    base = data.get('hfdl', {}).get('spdu', {}).get('gs_status', [])
-                    for station in base:
-                        freqs = [int(sf['freq']) for sf in station['freqs']]
-                        update[str(station['gs']['id'])] = freqs
-                        update[station['gs']['name']] = freqs
-                    self.on_update(update)
+                    self.on_update(data)
 
     def default_update(self, update):
-        GROUND_STATION_DATA.update(update)
-        print(GROUND_STATION_DATA)
+        print(update)
 
 
 def balancing_iter(sources, targets=None, pivot=None):
@@ -388,11 +477,13 @@ class HFDLListener:
     soapysdr = None
     device_settings = None
     acars_hub = None
+    ground_stations = None
     ground_station_updater = None
     ground_station_log = pathlib.Path(f'{DUMB_SHARE_PATH}') / 'current.log'
 
-    def __init__(self):
+    def __init__(self, ground_stations):
         self.process = None
+        self.ground_stations = ground_stations
 
     def command(self, frequencies):
         #
@@ -466,7 +557,7 @@ class HFDLListener:
             print("SDR settled")
             await self.start(frequencies)
             print("restarted")
-            self.ground_station_updater = SquitterWatcher(self.ground_station_log)
+            self.ground_station_updater = SquitterWatcher(self.ground_station_log, self.ground_stations.merge_squitter)
             asyncio.ensure_future(self.ground_station_updater.run())
 
         def exited(self, _=None):
@@ -494,6 +585,7 @@ async def busy():
     while True:
         await asyncio.sleep(1)
 
+
 def split_stations(stations):
     if not stations or stations == '.':
         return []
@@ -520,6 +612,7 @@ def common_params(func):
     @click.option('--skip-fill', is_flag=True)
     @click.option('--max-samples', type=int, default=os.getenv('DUMPHFDL_MAX_SAMPLES', MAXIMUM_SAMPLE_SIZE))
     @click.option('--ignore-ranges', default=os.getenv('DUMPHFDL_IGNORE_RANGES', []))
+    @click.option('--gs-cache', help='Airframes Station Data path', default=os.getenv('DUMPHFDL_AIRFRAMES_CACHE'))
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         return func(*args, **kwargs)
@@ -547,11 +640,14 @@ def main(ctx):
 @click.option('--soapysdr', default=os.getenv('DUMPHFDL_SOAPYSDR'))
 @click.option('--device-settings', default=os.getenv('DUMPHFDL_DEVICE_SETTINGS'))
 @click.option('--acars-hub', default=os.getenv('DUMPHFDL_ACARS_HUB'))
-def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges,
+def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache,
         station_id, antenna, statsd, quiet, system_table, system_table_save, log_path,
         watch_interval, sdr_settle, soapysdr, device_settings, acars_hub
     ):
-    listener = HFDLListener()
+
+    ground_stations = GroundStations(gs_cache)
+
+    listener = HFDLListener(ground_stations)
     listener.station_id = station_id
     listener.antenna = antenna
     listener.statsd_server = statsd
@@ -568,7 +664,7 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges,
         print(f'frequencies: {new_frequencies} = {bandwidth_for_interval(new_frequencies)}')
         loop.create_task(listener.restart(new_frequencies))
 
-    watcher = GroundStationWatcher(frequencies_updated)
+    watcher = GroundStationWatcher(ground_stations, frequencies_updated)
     watcher.core_ids = split_stations(core_ids)
     watcher.fringe_ids = split_stations(fringe_ids)
     watcher.skip_fill = skip_fill
@@ -590,13 +686,16 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges,
 @click.option('--core', help='Build pool from Core stations only', is_flag=True)
 @click.option('--named', help='Build pool from Core and Fringe stations only', is_flag=True)
 @click.option('--experiments', help='show other possible pools based on experimental strategies.', is_flag=True)
-def scan(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, core, named, experiments):
+def scan(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, core, named, experiments):
     global FRINGE_STATIONS, FILL_OTHER_STATIONS, EXPERIMENTAL
     EXPERIMENTAL = experiments
     if core:
         FRINGE_STATIONS = []
     FILL_OTHER_STATIONS = not (named or core)
-    watcher = GroundStationWatcher()
+
+    ground_stations = GroundStations(gs_cache)
+
+    watcher = GroundStationWatcher(gs_cache)
     watcher.core_ids = split_stations(core_ids)
     watcher.fringe_ids = split_stations(fringe_ids)
     watcher.skip_fill = skip_fill
