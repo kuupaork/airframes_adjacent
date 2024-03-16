@@ -109,7 +109,7 @@ class GroundStationWatcher:
             self.refresh()
             await asyncio.sleep(self.watch_interval)
 
-    def stop(self) -> None:
+    def stop(self):
         if self.task:
             self.task.cancel()
             self.task = None
@@ -282,10 +282,10 @@ class GroundStations:
         try:
             gs = self[station['id']]
         except KeyError:
-            self.stations_by_id[gs['id']] = gs
+            self.stations_by_id[station['id']] = station
         else:
             if gs['last_updated'] > station['last_updated']:
-                station.update(gs)
+                gs.update(station)
         self.update_lookups()
 
     def prune_expired(self):
