@@ -10,10 +10,12 @@ import datetime
 import functools
 import itertools
 import json
+import logging
 import os
 import pathlib
 import re
 import signal
+import sys
 import threading
 import time
 # third party
@@ -22,6 +24,10 @@ import requests     # apt install python3-requests or `pip install requests` or 
 
 # all frequencies/bandwidths are in kHz
 import fallback
+
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(sys.argv[0].rsplit('/', 1)[-1].rsplit('.', 1)[0] if __name__ == '__main__' else __name__)
 
 # The maximum practical kSamples/sec to accept. For my RSPdx, the technical limit is 10000 (10MS/s) but practical
 # experimentation shows that using this rate causes occasional data streaming errors, so I back it off a little bit
@@ -34,7 +40,7 @@ FILTER_FACTOR = 0.8
 # The URL to retrieve Ground Station from
 GROUND_STATION_URL = 'https://api.airframes.io/hfdl/ground-stations'
 # How long to cache ground station updates (seconds)
-GS_EXPIRY = 4 * 3600
+GS_EXPIRY = 6 * 3600
 #
 # How often (seconds) to update the frequency list (and probably restart dumphfdl)
 # Set with `--watch-interval` on command line or environment variable `DUMPHFDL_WATCH_INTERVAL`)
@@ -82,6 +88,7 @@ class GroundStationWatcher:
     skip_fill = False
     watch_interval = 600
     _max_sample_size = 20000
+    _sample_rates = None
 
     def __init__(self, ground_stations, on_update=None):
         self.ground_stations = ground_stations
@@ -105,7 +112,7 @@ class GroundStationWatcher:
 
     async def run(self):
         while True:
-            print("refreshing")
+            logger.info("refreshing")
             self.refresh()
             await asyncio.sleep(self.watch_interval)
 
@@ -118,13 +125,49 @@ class GroundStationWatcher:
         self.task = loop.create_task(self.run())
         return self.task
 
+    def remote(self, url):
+        data = {}
+        if url:
+            response = requests.get(url)
+            try: 
+                data = response.json()
+            except json.JSONDecodeError:
+                pass
+        return data
+
+    def parse_active_stations(self, data):
+        active_stations = {}
+        for station in data.get("ground_stations", []):
+            name = station["name"]
+            sid = str(station['id'])
+            active_stations[name] = sorted(map(int, station['frequencies'].get("active", [])))
+            active_stations[sid] = active_stations[name]
+        return active_stations
+
     def refresh(self):
-        response = requests.get(GROUND_STATION_URL)
-        try: 
-            data = response.json()
-        except json.JSONDecodeError:
-            data = {}
-        return self.update_active_stations(data)
+        sources = [
+            ('Airframes Ground Station URL', lambda: self.remote(GROUND_STATION_URL)),
+            ('Cached Squitter Data', lambda: self.ground_stations.pruned_dict()),
+            ('Backup Ground Station URL', lambda: self.remote(os.getenv('DUMPHFDL_BACKUP_URL'))),
+            ('All Allocated Frequencies', lambda: fallback.ALL_FREQUENCIES),
+        ]
+        logger.info('refreshing ground station data')
+        for name, source in sources:
+            ground_station_data = source()
+            parsed = self.parse_active_stations(ground_station_data) if ground_station_data else {}
+            if all(len(parsed.get(core_id, '')) > 0 for core_id in self.core_ids):
+                logger.info(f'Using {name}')
+                return self.update_active_stations(parsed)
+            else:
+                logger.info(f'Cannot update from {name}')
+        else:
+            raise ValueError('No frequency sources are valid')
+
+    def reconcile_samples(self):
+        max_window = 30000  # we will not need a sample size larger than this!
+        if self._sample_rates:
+            max_window = self._sample_rates[-1] // 1000
+        self.maximum_bandwidth = min(max_window, self._max_sample_size) * FILTER_FACTOR
 
     @property
     def max_sample_size(self):
@@ -133,33 +176,19 @@ class GroundStationWatcher:
     @max_sample_size.setter
     def max_sample_size(self, new_value):
         self._max_sample_size = int(new_value)
-        self.maximum_bandwidth = self._max_sample_size * FILTER_FACTOR
+        self.reconcile_samples()
 
-    def load_active_stations(self, data):
-        active_stations = {}
-        for station in data.get("ground_stations", []):
-            name = station["name"]
-            sid = str(station['id'])
-            active_stations[name] = sorted(map(int, station['frequencies'].get("active", [])))
-            active_stations[sid] = active_stations[name]
-        self.active_stations = active_stations
+    @property
+    def sample_rates(self):
+        return self._sample_rates
+
+    @sample_rates.setter
+    def sample_rates(self, windows):
+        self._sample_rates = windows
+        self.reconcile_samples()
 
     def update_active_stations(self, data):
-        self.load_active_stations(data)
-        if sum(len(f) for f in self.active_stations.values()) == 0:
-            print('no valid working stations detected')
-            # attempt to use the actively detected frequencies, but only if all core stations are available.
-            if all(core_id in self.ground_stations for core_id in self.core_ids):
-                # There's no expiry, so in pathological cases, this *could* get out of date. Ugh. Ignore for now.
-                print("using ground_station_updater update frequency list")
-                self.load_active_stations(self.ground_stations.dict())
-            elif self.last:
-                # This could also get out of date. Also ignoring that for now.
-                print("reusing results of previous scan")
-                return self.last
-            else:
-                print('Falling back to complete list. This is suboptimal')
-                self.load_active_stations(fallback.ALL_FREQUENCIES)
+        self.active_stations = data
         best_pool = self.best_pool()
         best_frequencies = list(best_pool)
         if best_frequencies != self.last:
@@ -167,7 +196,7 @@ class GroundStationWatcher:
             if callable(self.on_update):
                 self.on_update(best_frequencies)
         else:
-            print("frequencies unchanged")
+            logger.info("frequencies unchanged")
         return best_frequencies
 
     def create_pool(self, seed=None):
@@ -201,8 +230,8 @@ class GroundStationWatcher:
         high = list(high_pool)
         actual_pool = high_pool if len(high_pool) > len(low_pool) else low_pool
         if EXPERIMENTAL:
-            print("low pool:", low)
-            print("high pool:", high)
+            logger.info("low pool:", low)
+            logger.info("high pool:", high)
 
         # Fringe stations don't determine pool range, but fill in frequencies more likely to be heard
         # actual = build_freq_list(FRINGE_STATIONS, pool=actual)
@@ -245,33 +274,37 @@ class GroundStationWatcher:
 
         if EXPERIMENTAL:
             middle_pool = experimental_middle_pool()
-            print("[experimental] middle pool:", list(middle_pool), ('(unranked)'))
-            print('[experimental] iterate-core pools:')
+            logger.info("[experimental] middle pool:", list(middle_pool), ('(unranked)'))
+            logger.info('[experimental] iterate-core pools:')
             for pool in experimental_iterate_core():
-                print('    ', list(pool))
-            print('===')
+                logger.info('    ', list(pool))
+            logger.info('===')
 
 
 class GroundStations:
+    path = None
+
     def __init__(self, path=None):
         self.stations_by_id = {}
         self.name_lookup = {}
-        self.path = pathlib.Path(path)
         self.last = None
-        if (self.path):
+        if (path):
+            self.path = pathlib.Path(path)
             self.load()
 
     def load(self):
         if self.path and self.path.exists():
             s = self.path.read_text()
             if s:
-                self.last = json.loads(s)
-                self.merge_airframes(self.last)
+                self.last = s
+                self.merge_airframes(json.loads(s))
+                self.prune_expired()
 
     def save(self):
         if self.path:
             current = json.dumps(self.dict(), indent=4)
             if current != self.last:  # very naive
+                logger.info('saving station cache')
                 self.path.write_text(current)
                 self.last = current
 
@@ -284,7 +317,7 @@ class GroundStations:
         except KeyError:
             self.stations_by_id[station['id']] = station
         else:
-            if gs['last_updated'] > station['last_updated']:
+            if gs['last_updated'] < station['last_updated']:
                 gs.update(station)
         self.update_lookups()
 
@@ -293,7 +326,9 @@ class GroundStations:
         horizon = now - GS_EXPIRY
         for gs in list(self.stations_by_id.values()):
             if gs['last_updated'] < horizon:
+                logger.info(f'pruning {gs["id"]} ({horizon} > {gs["last_updated"]})')
                 del self.stations_by_id[gs['id']]
+        self.update_lookups()
 
     def merge_squitter(self, squitter):
         base = squitter.get('hfdl', {}).get('spdu', {}).get('gs_status', [])
@@ -323,21 +358,19 @@ class GroundStations:
     def dict(self):
         return {'ground_stations': list(self.stations_by_id.values())}
 
-    MISSING = object()
+    def pruned_dict(self):
+        self.prune_expired()
+        return self.dict()
+
     def __getitem__(self, key):
         try:
             gsid = int(key)
         except ValueError:
             gsid = key
-            lookup = self.stations_by_id
+            lookup = self.stations_by_name
         else:
-            lookup = self.name_lookup
-        try:
-            return lookup[key]
-        except AttributeError:
-            if default is not MISSING:
-                return default
-            raise
+            lookup = self.stations_by_id
+        return lookup[key]
 
     def __contains__(self, key):
         try:
@@ -371,7 +404,7 @@ class SquitterWatcher:
                     self.on_update(data)
 
     def default_update(self, update):
-        print(update)
+        logger.info(update)
 
 
 def balancing_iter(sources, targets=None, pivot=None):
@@ -382,7 +415,6 @@ def balancing_iter(sources, targets=None, pivot=None):
 
     if targets and pivot < len(targets):
         pivot_freq = targets[pivot]
-        # print(pivot_freq)
         source_pivot = bisect.bisect_left(sources, pivot_freq)
     elif pivot == -1:
         source_pivot = -1
@@ -459,6 +491,17 @@ class FrequencyPool:
             )
 
 
+def sample_rate_for(sample_size, sample_rates):
+    sample_size *= 1000
+    if not sample_rates:
+        return sample_size
+    current = 0
+    ix = bisect.bisect_right(sample_rates, sample_size)
+    if ix >= len(sample_rates):
+        raise ValueError(f'cannot fulfill desired sample rate: {sample_size} from {sample_rates}')
+    return sample_rates[ix]
+
+
 class HFDLListener:
     # Set this to your airframes.io station name.
     # Usual format is "<2-initals>-<nearest ICAO airport code><index>-HFDL"
@@ -480,18 +523,20 @@ class HFDLListener:
     ground_stations = None
     ground_station_updater = None
     ground_station_log = pathlib.Path(f'{DUMB_SHARE_PATH}') / 'current.log'
+    sample_rates = None
 
-    def __init__(self, ground_stations):
+    def __init__(self, ground_stations, sample_rates):
         self.process = None
         self.ground_stations = ground_stations
+        self.sample_rates = sample_rates
 
     def command(self, frequencies):
         #
         # If you use a different configuration, you'll have to adjust these to match your system.
-        sample_rate = int(bandwidth_for_interval(frequencies) / FILTER_FACTOR)
+        sample_rate = sample_rate_for(int(bandwidth_for_interval(frequencies) / FILTER_FACTOR), self.sample_rates)
         dump_cmd = [
             'dumphfdl',
-            '--sample-rate', str(sample_rate * 1000),
+            '--sample-rate', str(sample_rate),
         ]
         if self.device_settings:
             dump_cmd.extend(['--device-settings', self.device_settings,])
@@ -531,14 +576,14 @@ class HFDLListener:
         return asyncio.ensure_future(self.process.wait())
 
     def stop(self):
-        print("stopping")
+        logger.info("stopping")
         if self.process:
             self.process.send_signal(signal.SIGKILL)
 
     async def start(self, frequencies):
-        print("starting")
+        logger.info("starting")
         cmd = self.command(frequencies)
-        print(cmd)
+        logger.debug(cmd)
         if self.ground_station_updater:
             self.ground_station_updater.enabled = False
         if self.ground_station_log and self.ground_station_log.exists():
@@ -552,18 +597,18 @@ class HFDLListener:
 
     async def restart(self, frequencies):
         async def actual_restart(_=None):
-            print("SDR settling")
+            logger.info("SDR settling")
             await asyncio.sleep(self.sdr_settle)
-            print("SDR settled")
+            logger.info("SDR settled")
             await self.start(frequencies)
-            print("restarted")
+            logger.info("restarted")
             self.ground_station_updater = SquitterWatcher(self.ground_station_log, self.ground_stations.merge_squitter)
             asyncio.ensure_future(self.ground_station_updater.run())
 
         def exited(self, _=None):
             loop.create_task(actual_restart(_))
 
-        print("restarting")
+        logger.info("restarting")
         if self.process:
             self.on_exit().add_done_callback(exited)
             self.stop()
@@ -573,7 +618,7 @@ class HFDLListener:
     def exited(self, _=None):
         # here we might do some post-mortem, but nothing for now.
         self.process = None
-        print("exited")
+        logger.info("exited")
 
     def kill(self):
         if self.process:
@@ -613,6 +658,7 @@ def common_params(func):
     @click.option('--max-samples', type=int, default=os.getenv('DUMPHFDL_MAX_SAMPLES', MAXIMUM_SAMPLE_SIZE))
     @click.option('--ignore-ranges', default=os.getenv('DUMPHFDL_IGNORE_RANGES', []))
     @click.option('--gs-cache', help='Airframes Station Data path', default=os.getenv('DUMPHFDL_AIRFRAMES_CACHE'))
+    @click.option('--sample-rates', help='the sample sizes supported by your radio', default=os.getenv('DUMPHFDL_SAMPLE_RATES', ''))
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         return func(*args, **kwargs)
@@ -640,14 +686,15 @@ def main(ctx):
 @click.option('--soapysdr', default=os.getenv('DUMPHFDL_SOAPYSDR'))
 @click.option('--device-settings', default=os.getenv('DUMPHFDL_DEVICE_SETTINGS'))
 @click.option('--acars-hub', default=os.getenv('DUMPHFDL_ACARS_HUB'))
-def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache,
+def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, sample_rates,
         station_id, antenna, statsd, quiet, system_table, system_table_save, log_path,
         watch_interval, sdr_settle, soapysdr, device_settings, acars_hub
     ):
 
     ground_stations = GroundStations(gs_cache)
+    sample_rates = sorted(int(x) for x in sample_rates.split(',') if x)
 
-    listener = HFDLListener(ground_stations)
+    listener = HFDLListener(ground_stations, sample_rates)
     listener.station_id = station_id
     listener.antenna = antenna
     listener.statsd_server = statsd
@@ -661,7 +708,7 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache,
     listener.acars_hub = acars_hub
 
     def frequencies_updated(new_frequencies):
-        print(f'frequencies: {new_frequencies} = {bandwidth_for_interval(new_frequencies)}')
+        logger.info(f'frequencies: {new_frequencies} = {bandwidth_for_interval(new_frequencies)}')
         loop.create_task(listener.restart(new_frequencies))
 
     watcher = GroundStationWatcher(ground_stations, frequencies_updated)
@@ -670,6 +717,7 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache,
     watcher.skip_fill = skip_fill
     watcher.watch_interval = int(watch_interval)
     watcher.max_sample_size = max_samples
+    watcher.sample_rates = sample_rates
     watcher.set_ignore_ranges(ignore_ranges)
     # watcher.start()
 
@@ -686,7 +734,10 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache,
 @click.option('--core', help='Build pool from Core stations only', is_flag=True)
 @click.option('--named', help='Build pool from Core and Fringe stations only', is_flag=True)
 @click.option('--experiments', help='show other possible pools based on experimental strategies.', is_flag=True)
-def scan(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, core, named, experiments):
+def scan(
+        core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, sample_rates,
+        core, named, experiments
+    ):
     global FRINGE_STATIONS, FILL_OTHER_STATIONS, EXPERIMENTAL
     EXPERIMENTAL = experiments
     if core:
@@ -694,21 +745,24 @@ def scan(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, 
     FILL_OTHER_STATIONS = not (named or core)
 
     ground_stations = GroundStations(gs_cache)
+    sample_rates = sorted(int(x) for x in sample_rates.split(',') if x)
 
-    watcher = GroundStationWatcher(gs_cache)
+    watcher = GroundStationWatcher(ground_stations)
     watcher.core_ids = split_stations(core_ids)
     watcher.fringe_ids = split_stations(fringe_ids)
     watcher.skip_fill = skip_fill
     watcher.max_sample_size = max_samples
+    watcher.sample_rates = sample_rates
     watcher.set_ignore_ranges(ignore_ranges)
 
     freqs = watcher.refresh()
-    bandwidth = bandwidth_for_interval(freqs)
+    bandwidth = int(bandwidth_for_interval(freqs))
     samples = int(bandwidth / 0.8)
+    sample_rate = sample_rate_for(samples, watcher.sample_rates)
     watcher.experimental_pools()
-    print(f"Best Frequencies: {freqs}")
-    print(f"Required bandwidth: {bandwidth}kHz")
-    print(f"Required Samples/Second: {samples * 1000}")
+    logger.info(f"Best Frequencies: {freqs}")
+    logger.info(f"Required bandwidth: {bandwidth}kHz")
+    logger.info(f"Required Samples/Second: {sample_rate}")
 
 
 if __name__ == "__main__":

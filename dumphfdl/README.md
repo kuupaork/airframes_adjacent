@@ -83,6 +83,19 @@ Example:
 --gs-cache /tmp/ground-stations.json
 ```
 
+`--sample-rates`
+
+Allows you to provide a comma-separated list of specific sample rates. Only these sample rates will be used in dumphfdl command lines. This means that the effective maximum sample rate is the lower of the largest of these sample rates, and the value of `--max-samples`. See also the `DUMPHFDL_SAMPLE_RATES` environment variable.
+
+*Specify the sample rates in actual samples, not kSamples or MSamples*.
+
+```
+--sample-rates 912000,768000,456000,384000,256000,192000
+```
+
+Sets the available sample rates to those for an Airspy HF+ Discovery.
+
+
 ### `run` Specific
 
 Many of these options are passed through to `dumphfdl`. Others are used to configure other `dumphfdl` parameters.
@@ -189,10 +202,11 @@ DUMPHFDL_STATION_ID='MY-XYZA1-HFDL'
 DUMPHFDL_STATSD='stats.example:8125'
 DUMPHFDL_ACARS_HUB='localhost:5556'
 DUMPHFDL_AIRFRAMES_CACHE=/tmp/ground-stations.json
+# Airspy Discovery HF+ DUMPHFDL_SAMPLE_RATES=912000,768000,456000,384000,256000,192000
 ```
 
 ### Tip
-a bit 
+
 If you are using `bash` and you want to avoid polluting your environment with these variables, you can use something like the following to help. This assumes that your environment variables are set in a file named `.env`.
 
 ```
