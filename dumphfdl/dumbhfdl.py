@@ -129,7 +129,7 @@ class GroundStationWatcher:
         data = {}
         if url:
             response = requests.get(url)
-            try: 
+            try:
                 data = response.json()
             except json.JSONDecodeError:
                 pass
@@ -566,9 +566,8 @@ class HFDLListener:
             dump_cmd.extend(['--output', f'decoded:json:file:path={self.log_path}/hfdl.json.log,rotate=daily',])
         # special file for ground_station_updater.
         dump_cmd.extend(['--output', f'decoded:json:file:path={self.ground_station_log}'])
-        # TEMP
-        dump_cmd.extend(['--output', 'decoded:basestation:tcp:address=yto.lan,port=30025'])
-        # /TEMP
+        for output in json.loads(os.getenv('DUMPHFDL_OUTPUTS', '[]')):
+            dump_cmd.extend(['--output', output])
         dump_cmd += [str(f) for f in frequencies]
         return dump_cmd
 
