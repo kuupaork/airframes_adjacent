@@ -137,7 +137,11 @@ class GroundStationWatcher:
 
     def parse_active_stations(self, data):
         active_stations = {}
+        now = datetime.datetime.now().timestamp()
+        horizon = now - GS_EXPIRY
         for station in data.get("ground_stations", []):
+            if station['last_updated'] < horizon:
+                continue
             name = station["name"]
             sid = str(station['id'])
             active_stations[name] = sorted(map(int, station['frequencies'].get("active", [])))
