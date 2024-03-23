@@ -9,6 +9,7 @@ import bisect
 import datetime
 import functools
 import itertools
+import io
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import pathlib
 import re
 import signal
 import sys
+import tempfile
 import threading
 import time
 # third party
@@ -422,7 +424,11 @@ class SquitterWatcher:
         if not self.enabled:
             return
         with open(self.log_file) as log:
-            log.seek(0, 2)
+            try:
+                log.seek(0, 2)
+            except io.UnsupportedOperation:
+                # fifos don't support seeks, of course.
+                pass
             while self.enabled:
                 line = log.readline()
                 if not line:
@@ -554,16 +560,27 @@ class HFDLListener:
     acars_hub = None
     ground_stations = None
     ground_station_updater = None
-    ground_station_log = pathlib.Path(f'{DUMB_SHARE_PATH}') / 'current.log'
     sample_rates = None
     gain = None
     gain_elements = None
     killed = False
+    tempdirname = None
+    _fifo = None
 
     def __init__(self, ground_stations, sample_rates):
         self.process = None
         self.ground_stations = ground_stations
         self.sample_rates = sample_rates
+
+    @property
+    def fifo(self):
+        if self._fifo and self._fifo.exists():
+            return self._fifo
+        if self.tempdirname:
+            self._fifo = pathlib.Path(f'{self.tempdirname}/dumphfdl.pipe')
+            os.mkfifo(self._fifo)
+            return self._fifo
+        return pathlib.Path(f'{DUMB_SHARE_PATH}') / 'current.log'
 
     def command(self, frequencies):
         #
@@ -604,7 +621,7 @@ class HFDLListener:
         if self.log_path:
             dump_cmd.extend(['--output', f'decoded:json:file:path={self.log_path}/hfdl.json.log,rotate=daily',])
         # special file for ground_station_updater.
-        dump_cmd.extend(['--output', f'decoded:json:file:path={self.ground_station_log}'])
+        dump_cmd.extend(['--output', f'decoded:json:file:path={self.fifo}'])
         for output in json.loads(os.getenv('DUMPHFDL_OUTPUTS', '[]')):
             dump_cmd.extend(['--output', output])
         dump_cmd += [str(f) for f in frequencies]
@@ -625,8 +642,8 @@ class HFDLListener:
         logger.debug(cmd)
         if self.ground_station_updater:
             self.ground_station_updater.enabled = False
-        if self.ground_station_log and self.ground_station_log.exists():
-            self.ground_station_log.unlink()
+        if self.fifo and self.fifo.exists():
+            self.fifo.unlink()
         self.process = await asyncio.create_subprocess_exec(*cmd)
         # if/when we become interested in looking for errors in output...
         # stdout=asyncio.subprocess.PIPE
@@ -641,7 +658,7 @@ class HFDLListener:
             logger.info("SDR settled")
             await self.start(frequencies)
             logger.info("restarted")
-            self.ground_station_updater = SquitterWatcher(self.ground_station_log, self.ground_stations.merge_packet)
+            self.ground_station_updater = SquitterWatcher(self.fifo, self.ground_stations.merge_packet)
             asyncio.ensure_future(self.ground_station_updater.run())
 
         def exited(self, _=None):
@@ -764,14 +781,18 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, s
     watcher.max_sample_size = max_samples
     watcher.sample_rates = sample_rates
     watcher.set_ignore_ranges(ignore_ranges)
-    # watcher.start()
 
-    try:
-        loop.run_until_complete(watcher.run())
-    except asyncio.CancelledError:
-        listener.kill()
-    except KeyboardInterrupt:
-        listener.kill()
+    with tempfile.TemporaryDirectory() as tempdirname:
+        listener.tempdirname = tempdirname
+        try:
+            loop.run_until_complete(watcher.run())
+        except asyncio.CancelledError:
+            listener.kill()
+        except KeyboardInterrupt:
+            listener.kill()
+        except:
+            listener.kill()
+            raise
 
 
 @main.command()
