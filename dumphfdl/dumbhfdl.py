@@ -35,7 +35,7 @@ logger = logging.getLogger(sys.argv[0].rsplit('/', 1)[-1].rsplit('.', 1)[0] if _
 MAXIMUM_SAMPLE_SIZE = 9250
 
 # A naive factor to apply to the Sample Size to account for an aliasing filter the radio may use.
-FILTER_FACTOR = 0.8
+FILTER_FACTOR = 0.9
 
 # The URL to retrieve Ground Station from
 GROUND_STATION_URL = 'https://api.airframes.io/hfdl/ground-stations'
@@ -230,8 +230,8 @@ class GroundStationWatcher:
         high = list(high_pool)
         actual_pool = high_pool if len(high_pool) > len(low_pool) else low_pool
         if EXPERIMENTAL:
-            logger.info("low pool:", low)
-            logger.info("high pool:", high)
+            logger.info(f"low pool: {low}")
+            logger.info(f"high pool: {high}")
 
         # Fringe stations don't determine pool range, but fill in frequencies more likely to be heard
         # actual = build_freq_list(FRINGE_STATIONS, pool=actual)
@@ -274,10 +274,10 @@ class GroundStationWatcher:
 
         if EXPERIMENTAL:
             middle_pool = experimental_middle_pool()
-            logger.info("[experimental] middle pool:", list(middle_pool), ('(unranked)'))
+            logger.info("[experimental] middle pool: {list(middle_pool)} (unranked)")
             logger.info('[experimental] iterate-core pools:')
             for pool in experimental_iterate_core():
-                logger.info('    ', list(pool))
+                logger.info(f'    {list(pool)}')
             logger.info('===')
 
 
@@ -524,6 +524,7 @@ class HFDLListener:
     ground_station_updater = None
     ground_station_log = pathlib.Path(f'{DUMB_SHARE_PATH}') / 'current.log'
     sample_rates = None
+    killed = False
 
     def __init__(self, ground_stations, sample_rates):
         self.process = None
@@ -545,7 +546,7 @@ class HFDLListener:
         if not self.quiet:
             dump_cmd.extend(['--output', 'decoded:text:file:path=/dev/stdout',])
         if self.antenna:
-            dump_cmd.extend(['--antenna', 'Antenna B',])
+            dump_cmd.extend(['--antenna', f'Antenna {self.antenna}',])
         if self.statsd_server:
             dump_cmd.extend([
                 '--statsd', self.statsd_server,
@@ -581,6 +582,7 @@ class HFDLListener:
 
     async def start(self, frequencies):
         logger.info("starting")
+        self.frequencies = frequencies
         cmd = self.command(frequencies)
         logger.debug(cmd)
         if self.ground_station_updater:
@@ -618,11 +620,15 @@ class HFDLListener:
         # here we might do some post-mortem, but nothing for now.
         self.process = None
         logger.info("exited")
+        if not self.killed:
+            logger.info("restarting from unexpected exit")
+            loop.call_soon(self.restart, self.frequencies)
 
     def kill(self):
         if self.process:
             self.process.terminate()
             self.process = None
+            self.killed = True
 
 
 async def busy():
