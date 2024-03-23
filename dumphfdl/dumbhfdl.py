@@ -140,7 +140,7 @@ class GroundStationWatcher:
         now = datetime.datetime.now().timestamp()
         horizon = now - GS_EXPIRY
         for station in data.get("ground_stations", []):
-            if station['last_updated'] < horizon:
+            if 0 < station['last_updated'] < horizon:
                 continue
             name = station["name"]
             sid = str(station['id'])
@@ -315,14 +315,17 @@ class GroundStations:
     def update_lookups(self):
         self.name_lookup = {gs['name']: gs for gs in self.stations_by_id.values()}
 
-    def merge_station(self, station):
-        try:
-            gs = self[station['id']]
-        except KeyError:
-            self.stations_by_id[station['id']] = station
+    def merge_station(self, station, only_if_missing=False):
+        if only_if_missing:
+            self.stations_by_id.setdefault(station['id'], station)
         else:
-            if gs['last_updated'] < station['last_updated']:
-                gs.update(station)
+            try:
+                gs = self[station['id']]
+            except KeyError:
+                self.stations_by_id[station['id']] = station
+            else:
+                if gs['last_updated'] < station['last_updated']:
+                    gs.update(station)
         self.update_lookups()
 
     def prune_expired(self):
@@ -334,12 +337,34 @@ class GroundStations:
                 del self.stations_by_id[gs['id']]
         self.update_lookups()
 
-    def merge_squitter(self, squitter):
+    def merge_packet(self, packet):
+        last_updated = packet.get('hfdl', {}).get('t', {}).get('sec', 0)
+        if packet.get('hfdl', {}).get('spdu', {}).get('gs_status'):
+            self.merge_squitter(packet, last_updated)
+        elif packet.get('hfdl', {}).get('lpdu', {}).get('hfnpdu', {}).get('type', {}).get('id'):
+            self.merge_freq_update(packet, last_updated)
+
+    def merge_squitter(self, squitter, last_updated):
         base = squitter.get('hfdl', {}).get('spdu', {}).get('gs_status', [])
-        last_updated = squitter.get('hfdl', {}).get('t', {}).get('sec', 0)
         ground_stations = []
         for station in base:
             freqs = sorted(map(int, (sf['freq'] for sf in station['freqs'])))
+            gs = {
+                'id': station['gs']['id'],
+                'name': station['gs']['name'],
+                'frequencies': {
+                    'active': freqs,
+                },
+                'last_updated': last_updated
+            }
+            self.merge_station(gs)
+        self.prune_expired()
+        self.save()
+
+    def merge_freq_update(self, packet, last_update):
+        base = packet.get('hfdl', {}).get('lpdu', {}).get('hfnpdu', {}).get('freq_data', [])
+        for station in base:
+            freqs = sorted(map(int, (sf['freq'] for sf in station['heard_on_freqs'])))
             gs = {
                 'id': station['gs']['id'],
                 'name': station['gs']['name'],
@@ -404,6 +429,9 @@ class SquitterWatcher:
                     await asyncio.sleep(1)
                     continue
                 if '"gs_status"' in line:
+                    data = json.loads(line)
+                    self.on_update(data)
+                elif '"Frequency data"' in line:
                     data = json.loads(line)
                     self.on_update(data)
 
@@ -528,6 +556,8 @@ class HFDLListener:
     ground_station_updater = None
     ground_station_log = pathlib.Path(f'{DUMB_SHARE_PATH}') / 'current.log'
     sample_rates = None
+    gain = None
+    gain_elements = None
     killed = False
 
     def __init__(self, ground_stations, sample_rates):
@@ -547,6 +577,10 @@ class HFDLListener:
             dump_cmd.extend(['--device-settings', self.device_settings,])
         if self.soapysdr:
             dump_cmd.extend(['--soapysdr', self.soapysdr,])
+        if self.gain_elements:
+            dump_cmd.extend(['--gain-elements', self.gain_elements])
+        if self.gain:
+            dump_cmd.extend(['--gain', self.gain])
         if not self.quiet:
             dump_cmd.extend(['--output', 'decoded:text:file:path=/dev/stdout',])
         if self.antenna:
@@ -607,7 +641,7 @@ class HFDLListener:
             logger.info("SDR settled")
             await self.start(frequencies)
             logger.info("restarted")
-            self.ground_station_updater = SquitterWatcher(self.ground_station_log, self.ground_stations.merge_squitter)
+            self.ground_station_updater = SquitterWatcher(self.ground_station_log, self.ground_stations.merge_packet)
             asyncio.ensure_future(self.ground_station_updater.run())
 
         def exited(self, _=None):
@@ -715,6 +749,8 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, s
     listener.soapysdr = soapysdr
     listener.device_settings = device_settings
     listener.acars_hub = acars_hub
+    listener.gain = os.getenv('DUMPHFDL_GAIN')
+    listener.gain_elements = os.getenv('DUMPHFDL_GAIN_ELEMENTS')
 
     def frequencies_updated(new_frequencies):
         logger.info(f'frequencies: {new_frequencies} = {bandwidth_for_interval(new_frequencies)}')
