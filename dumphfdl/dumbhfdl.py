@@ -133,7 +133,7 @@ class GroundStationWatcher:
             response = requests.get(url)
             try:
                 data = response.json()
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, requests.JSONDecodeError):
                 pass
         return data
 
