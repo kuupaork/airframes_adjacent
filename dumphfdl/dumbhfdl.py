@@ -333,10 +333,10 @@ class GroundStations:
     def prune_expired(self):
         now = datetime.datetime.now().timestamp()
         horizon = now - GS_EXPIRY
-        for gs in list(self.stations_by_id.values()):
+        for key, gs in list(self.stations_by_id.items()):
             if gs['last_updated'] < horizon:
-                logger.info(f'pruning {gs["id"]} ({horizon} > {gs["last_updated"]})')
-                del self.stations_by_id[gs['id']]
+                logger.info(f'pruning {key} ({horizon} > {gs["last_updated"]})')
+                del self.stations_by_id[key]
         self.update_lookups()
 
     def merge_packet(self, packet):
@@ -357,13 +357,13 @@ class GroundStations:
                 'frequencies': {
                     'active': freqs,
                 },
-                'last_updated': last_updated
+                'last_updated': last_updated,
             }
             self.merge_station(gs)
         self.prune_expired()
         self.save()
 
-    def merge_freq_update(self, packet, last_update):
+    def merge_freq_update(self, packet, last_updated):
         base = packet.get('hfdl', {}).get('lpdu', {}).get('hfnpdu', {}).get('freq_data', [])
         for station in base:
             freqs = sorted(map(int, (sf['freq'] for sf in station['heard_on_freqs'])))
@@ -373,7 +373,7 @@ class GroundStations:
                 'frequencies': {
                     'active': freqs,
                 },
-                'last_updated': last_updated
+                'last_updated': last_updated,
             }
             self.merge_station(gs)
         self.prune_expired()
@@ -677,13 +677,13 @@ class HFDLListener:
         logger.info("exited")
         if not self.killed:
             logger.info("restarting from unexpected exit")
-            loop.call_soon(self.restart, self.frequencies)
+            loop.create_task(self.restart(self.frequencies))
 
     def kill(self):
         if self.process:
+            self.killed = True
             self.process.terminate()
             self.process = None
-            self.killed = True
 
 
 async def busy():
