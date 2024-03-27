@@ -6,6 +6,7 @@
 # system libraries
 import asyncio.subprocess
 import bisect
+import collections
 import datetime
 import functools
 import itertools
@@ -28,7 +29,7 @@ import requests     # apt install python3-requests or `pip install requests` or 
 import fallback
 
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s')
 logger = logging.getLogger(sys.argv[0].rsplit('/', 1)[-1].rsplit('.', 1)[0] if __name__ == '__main__' else __name__)
 
 # The maximum practical kSamples/sec to accept. For my RSPdx, the technical limit is 10000 (10MS/s) but practical
@@ -42,7 +43,7 @@ FILTER_FACTOR = 0.9
 # The URL to retrieve Ground Station from
 GROUND_STATION_URL = 'https://api.airframes.io/hfdl/ground-stations'
 # How long to cache ground station updates (seconds)
-GS_EXPIRY = 6 * 3600
+GS_EXPIRY = 3 * 3600
 #
 # How often (seconds) to update the frequency list (and probably restart dumphfdl)
 # Set with `--watch-interval` on command line or environment variable `DUMPHFDL_WATCH_INTERVAL`)
@@ -84,6 +85,166 @@ def bandwidth_for_interval(interval):
     return interval[-1] - interval[0]
 
 
+class GroundStation:
+    last_updated = 0
+    frequencies = []
+    dirty = False
+    name = None
+    gsid = "unknown"
+
+    def __setattr__(self, name, value):
+        oldval = getattr(self, name, object())
+        super().__setattr__(name, value)
+        if name != 'dirty' and value != oldval:
+            super().__setattr__('dirty', True)
+
+    def update_from_station(self, data):
+        if data.last_updated > self.last_updated:
+            self.last_updated = data.last_updated
+            self.gsid = data.gsid
+            self.name = data.name
+            self.frequencies = data.frequencies
+
+    def update_from_airframes(self, data, mark_clean=False):
+        if data['last_updated'] > self.last_updated:
+            self.last_updated = data['last_updated']
+            self.gsid = data['id']
+            self.name = data['name']
+            self.frequencies = sorted(data['frequencies']['active'])
+            logger.debug(f'airframes update for {self}')
+            if mark_clean:
+                self.mark_clean()
+
+    def update_from_squitter(self, data, last_updated):
+        if last_updated > self.last_updated:
+            self.last_updated = last_updated
+            self.gsid = data['gs']['id']
+            self.name = data['gs']['name']
+            self.frequencies = sorted(map(int, (sf['freq'] for sf in data['freqs'])))
+            logger.debug(f'squitter update for {self}')
+
+    def update_from_hfnpdu(self, data, last_updated):
+        if not self.last_updated:
+            self.last_updated = last_updated
+            self.gsid = data['gs']['id']
+            self.name = data['gs']['name']
+            self.frequencies = sorted(map(int, (sf['freq'] for sf in data['heard_on_freqs'])))
+            logger.debug(f'hfnpdu update for {self}')
+
+    def dict(self):
+        return {
+            'id': self.gsid,
+            'name': self.name,
+            'frequencies': {
+                'active': self.frequencies,
+            },
+            'last_updated': self.last_updated,
+        }
+
+    def mark_clean(self):
+        self.dirty = False
+
+    def is_valid(self):
+        now = datetime.datetime.now().timestamp()
+        horizon = now - GS_EXPIRY
+        return self.last_updated >= horizon and self.frequencies
+
+    def __str__(self):
+        return f'#{self.gsid}. {self.name} ({",".join(str(f) for f in self.frequencies)})'
+
+
+class GroundStations:
+    path = None
+
+    def __init__(self, path=None):
+        self.stations_by_id = collections.defaultdict(GroundStation)
+        self.stations_by_name = {}
+        self.last = None
+        if (path):
+            self.path = pathlib.Path(path)
+            self.load()
+
+    def load(self):
+        if self.path and self.path.exists():
+            s = self.path.read_text()
+            if s:
+                self.last = s
+                self.merge_airframes(json.loads(s), mark_clean=True)
+
+    def save(self):
+        if self.path:
+            current = json.dumps(self.dict(), indent=4)
+            if current != self.last:  # very naive
+                logger.info('saving station cache')
+                self.path.write_text(current)
+                self.last = current
+                map(lambda that: that.mark_clean(), self.stations)
+
+    def update_lookups(self):
+        self.stations_by_name = {gs.name: gs for gs in self.stations if gs.name}
+
+    def prune_expired(self):
+        for station in list(self.stations_by_id.values()):
+            if not station.is_valid() and station.gsid in self.stations_by_id:
+                logger.info(f'pruning {station}')
+                del self.stations_by_id[station.gsid]
+
+    def merge_airframes(self, airframes, is_load=False, mark_clean=False):
+        for gs in airframes.get('ground_stations', []):
+            self[gs['id']].update_from_airframes(gs, mark_clean)
+        self.update_lookups()
+        self.prune_expired()
+        self.save()
+
+    def merge_packet(self, packet):
+        hfdl = packet.get('hfdl', {})
+        last_updated = hfdl.get('t', {}).get('sec', 0)
+        for station in hfdl.get('spdu', {}).get('gs_status', []):
+            self[station['gs']['id']].update_from_squitter(station, last_updated)
+        for station in hfdl.get('lpdu', {}).get('hfnpdu', {}).get('freq_data', []):
+            self[station['gs']['id']].update_from_hfnpdu(station, last_updated)
+        self.update_lookups()
+        self.prune_expired()
+        self.save()
+
+    def merge(self, other):
+        for gs in other.stations_by_id.values():
+            self.stations_by_id[gs.gsid].update_from_station(gs)
+        self.update_lookups()
+        self.prune_expired()
+        self.save()
+
+    def dict(self):
+        return {'ground_stations': list(station.dict() for station in self.stations_by_id.values())}
+
+    def pruned_dict(self):
+        self.prune_expired()
+        return self.dict()
+
+    def __getitem__(self, key):
+        try:
+            return self.stations_by_id[int(key)]
+        except ValueError:
+            return self.stations_by_name[key]
+
+    def __contains__(self, key):
+        try:
+            return int(key) in self.stations_by_id
+        except ValueError:
+            pass
+        return key in self.stations_by_name
+
+    def frequencies(self, key):
+        try:
+            return self[key].frequencies
+        except KeyError:
+            return ()
+
+    @property
+    def stations(self):
+        return self.stations_by_id.values()
+
+
 class GroundStationWatcher:
     core_ids = []
     fringe_ids = []
@@ -94,7 +255,6 @@ class GroundStationWatcher:
 
     def __init__(self, ground_stations, on_update=None):
         self.ground_stations = ground_stations
-        self.active_stations = {}
         self.task = None
         self.on_update = on_update
         self.last = []
@@ -118,15 +278,6 @@ class GroundStationWatcher:
             self.refresh()
             await asyncio.sleep(self.watch_interval)
 
-    def stop(self):
-        if self.task:
-            self.task.cancel()
-            self.task = None
-
-    def start(self):
-        self.task = loop.create_task(self.run())
-        return self.task
-
     def remote(self, url):
         data = {}
         if url:
@@ -137,18 +288,10 @@ class GroundStationWatcher:
                 pass
         return data
 
-    def parse_active_stations(self, data):
-        active_stations = {}
-        now = datetime.datetime.now().timestamp()
-        horizon = now - GS_EXPIRY
-        for station in data.get("ground_stations", []):
-            if 0 < station['last_updated'] < horizon:
-                continue
-            name = station["name"]
-            sid = str(station['id'])
-            active_stations[name] = sorted(map(int, station['frequencies'].get("active", [])))
-            active_stations[sid] = active_stations[name]
-        return active_stations
+    def parse_airframes(self, data):
+        stations = GroundStations()  # in-memory only
+        stations.merge_airframes(data)
+        return stations
 
     def refresh(self):
         sources = [
@@ -160,10 +303,11 @@ class GroundStationWatcher:
         logger.info('refreshing ground station data')
         for name, source in sources:
             ground_station_data = source()
-            parsed = self.parse_active_stations(ground_station_data) if ground_station_data else {}
-            if all(len(parsed.get(core_id, '')) > 0 for core_id in self.core_ids):
+            parsed = self.parse_airframes(ground_station_data)
+            if all(parsed.frequencies(core_id) for core_id in self.core_ids):
                 logger.info(f'Using {name}')
-                return self.update_active_stations(parsed)
+                self.ground_stations.merge(parsed)
+                return self.choose_best_frequencies()
             else:
                 logger.info(f'Cannot update from {name}')
         else:
@@ -173,7 +317,7 @@ class GroundStationWatcher:
         max_window = 30000  # we will not need a sample size larger than this!
         if self._sample_rates:
             max_window = self._sample_rates[-1] // 1000
-        self.maximum_bandwidth = min(max_window, self._max_sample_size) * FILTER_FACTOR
+        self.maximum_bandwidth = min(max_window, self.max_sample_size) * FILTER_FACTOR
 
     @property
     def max_sample_size(self):
@@ -183,6 +327,7 @@ class GroundStationWatcher:
     def max_sample_size(self, new_value):
         self._max_sample_size = int(new_value)
         self.reconcile_samples()
+        logger.debug(f'maximum bandwidth is now {self.maximum_bandwidth}')
 
     @property
     def sample_rates(self):
@@ -193,8 +338,7 @@ class GroundStationWatcher:
         self._sample_rates = windows
         self.reconcile_samples()
 
-    def update_active_stations(self, data):
-        self.active_stations = data
+    def choose_best_frequencies(self):
         best_pool = self.best_pool()
         best_frequencies = list(best_pool)
         if best_frequencies != self.last:
@@ -202,7 +346,7 @@ class GroundStationWatcher:
             if callable(self.on_update):
                 self.on_update(best_frequencies)
         else:
-            logger.info("frequencies unchanged")
+            logger.info(f"frequencies unchanged {best_frequencies}")
         return best_frequencies
 
     def create_pool(self, seed=None):
@@ -226,7 +370,7 @@ class GroundStationWatcher:
           there's a lot of noise and not much signal below 6MHz, so I've marked that range as ignored and it works well
         """
         # build core range
-        core_stations = [self.active_stations.get(n, []) for n in self.core_ids]
+        core_stations = [self.ground_stations[n] for n in self.core_ids]
         low_pool = self.create_pool()
         low_pool.add_stations(core_stations, pivot=0)
         low = list(low_pool)
@@ -235,19 +379,17 @@ class GroundStationWatcher:
         high_pool.add_stations(core_stations, pivot=-1)
         high = list(high_pool)
         actual_pool = high_pool if len(high_pool) > len(low_pool) else low_pool
-        if EXPERIMENTAL:
-            logger.info(f"low pool: {low}")
-            logger.info(f"high pool: {high}")
+        logger.debug(f"low pool: {low}")
+        logger.debug(f"high pool: {high}")
 
         # Fringe stations don't determine pool range, but fill in frequencies more likely to be heard
-        # actual = build_freq_list(FRINGE_STATIONS, pool=actual)
         # don't need pivot here.
-        actual_pool.add_stations([self.active_stations.get(n, []) for n in self.fringe_ids])
+        actual_pool.add_stations(self.ground_stations[n] for n in self.fringe_ids)
 
         # now fill in the others "just in case"
         if not self.skip_fill:
             # a bit wasteful, but these are all small enough that completely readding everything won't hurt.
-            actual_pool.add_stations(self.active_stations.values())
+            actual_pool.add_stations(self.ground_stations.stations)
         return actual_pool
 
     def experimental_pools(self):
@@ -257,7 +399,7 @@ class GroundStationWatcher:
             # "middle pool" works a bit differently to the high and low pools above. Instead of ranking the Core
             # stations, it combines all their frequencies into a single group. It takes the middle entry from the
             # list and works outwards from it until the bandwidth is filled.
-            core_stations = [self.active_stations.get(n, []) for n in self.core_ids]
+            core_stations = [self.ground_stations.frequencies(n) for n in self.core_ids]
             core_freqs = sorted(itertools.chain(*core_stations))
             middle_pool = self.create_pool()
             middle_pool.extend(core_freqs)
@@ -267,7 +409,7 @@ class GroundStationWatcher:
             # "iterate core" is similar to "middle pool", but instead of picking just one frequency to build out from,
             # each "core" frequency is tried in turn, building a pool outward from it. The unique pools generated by
             # this mechanism are yielded.
-            core_station_active = [self.active_stations.get(name, []) for name in self.core_ids]
+            core_station_active = [self.ground_stations.frequencies(n) for n in self.core_ids]
             core_freqs = sorted(itertools.chain(*core_station_active))
             seen = []
             for ix in range(0, len(core_freqs)):
@@ -287,159 +429,33 @@ class GroundStationWatcher:
             logger.info('===')
 
 
-class GroundStations:
-    path = None
-
-    def __init__(self, path=None):
-        self.stations_by_id = {}
-        self.name_lookup = {}
-        self.last = None
-        if (path):
-            self.path = pathlib.Path(path)
-            self.load()
-
-    def load(self):
-        if self.path and self.path.exists():
-            s = self.path.read_text()
-            if s:
-                self.last = s
-                self.merge_airframes(json.loads(s))
-                self.prune_expired()
-
-    def save(self):
-        if self.path:
-            current = json.dumps(self.dict(), indent=4)
-            if current != self.last:  # very naive
-                logger.info('saving station cache')
-                self.path.write_text(current)
-                self.last = current
-
-    def update_lookups(self):
-        self.name_lookup = {gs['name']: gs for gs in self.stations_by_id.values()}
-
-    def merge_station(self, station, only_if_missing=False):
-        if only_if_missing:
-            self.stations_by_id.setdefault(station['id'], station)
-        else:
-            try:
-                gs = self[station['id']]
-            except KeyError:
-                self.stations_by_id[station['id']] = station
-            else:
-                if gs['last_updated'] < station['last_updated']:
-                    gs.update(station)
-        self.update_lookups()
-
-    def prune_expired(self):
-        now = datetime.datetime.now().timestamp()
-        horizon = now - GS_EXPIRY
-        for key, gs in list(self.stations_by_id.items()):
-            if gs['last_updated'] < horizon:
-                logger.info(f'pruning {key} ({horizon} > {gs["last_updated"]})')
-                del self.stations_by_id[key]
-        self.update_lookups()
-
-    def merge_packet(self, packet):
-        last_updated = packet.get('hfdl', {}).get('t', {}).get('sec', 0)
-        if packet.get('hfdl', {}).get('spdu', {}).get('gs_status'):
-            self.merge_squitter(packet, last_updated)
-        elif packet.get('hfdl', {}).get('lpdu', {}).get('hfnpdu', {}).get('type', {}).get('id'):
-            self.merge_freq_update(packet, last_updated)
-
-    def merge_squitter(self, squitter, last_updated):
-        base = squitter.get('hfdl', {}).get('spdu', {}).get('gs_status', [])
-        ground_stations = []
-        for station in base:
-            freqs = sorted(map(int, (sf['freq'] for sf in station['freqs'])))
-            gs = {
-                'id': station['gs']['id'],
-                'name': station['gs']['name'],
-                'frequencies': {
-                    'active': freqs,
-                },
-                'last_updated': last_updated,
-            }
-            self.merge_station(gs)
-        self.prune_expired()
-        self.save()
-
-    def merge_freq_update(self, packet, last_updated):
-        base = packet.get('hfdl', {}).get('lpdu', {}).get('hfnpdu', {}).get('freq_data', [])
-        for station in base:
-            freqs = sorted(map(int, (sf['freq'] for sf in station['heard_on_freqs'])))
-            gs = {
-                'id': station['gs']['id'],
-                'name': station['gs']['name'],
-                'frequencies': {
-                    'active': freqs,
-                },
-                'last_updated': last_updated,
-            }
-            self.merge_station(gs)
-        self.prune_expired()
-        self.save()
-
-    def merge_airframes(self, airframes):
-        for gs in airframes.get('ground_stations', []):
-            gs['frequencies']['active'] = sorted(map(int, gs['frequencies'].get("active", [])))
-            self.merge_station(gs)
-        self.prune_expired()
-        self.save()
-
-    def dict(self):
-        return {'ground_stations': list(self.stations_by_id.values())}
-
-    def pruned_dict(self):
-        self.prune_expired()
-        return self.dict()
-
-    def __getitem__(self, key):
-        try:
-            gsid = int(key)
-        except ValueError:
-            gsid = key
-            lookup = self.stations_by_name
-        else:
-            lookup = self.stations_by_id
-        return lookup[key]
-
-    def __contains__(self, key):
-        try:
-            return int(key) in self.stations_by_id
-        except ValueError:
-            pass
-        return key in self.name_lookup
-
-
 class SquitterWatcher:
-    def __init__(self, log_file, on_update=None):
-        self.log_file = pathlib.Path(log_file)
+    def __init__(self, fifo, on_update=None):
+        self.fifo = pathlib.Path(fifo)
         self.on_update = on_update or self.default_update
         self.enabled = False
 
     async def run(self):
         self.enabled = True
-        while self.enabled and not self.log_file.exists():
+        logger.debug(f'watching for squitters and frequency updates')
+        await self.watch_fifo(self.fifo)
+
+    async def watch_fifo(self, fifo):
+        while self.enabled and not fifo.exists():
             await asyncio.sleep(1)
-        if not self.enabled:
-            return
-        with open(self.log_file) as log:
-            try:
-                log.seek(0, 2)
-            except io.UnsupportedOperation:
-                # fifos don't support seeks, of course.
-                pass
-            while self.enabled:
-                line = log.readline()
-                if not line:
-                    await asyncio.sleep(1)
-                    continue
-                if '"gs_status"' in line:
-                    data = json.loads(line)
-                    self.on_update(data)
-                elif '"Frequency data"' in line:
-                    data = json.loads(line)
-                    self.on_update(data)
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        with open(fifo) as pipe:
+            await loop.connect_read_pipe(lambda: protocol, pipe)
+            async for data in reader:
+                line = data.decode('utf8')
+                if line:
+                    if '"gs_status"' in line:
+                        packet = json.loads(line)
+                        self.on_update(packet)
+                    elif '"Frequency data"' in line:
+                        packet = json.loads(line)
+                        self.on_update(packet)
 
     def default_update(self, update):
         logger.info(update)
@@ -453,22 +469,30 @@ def balancing_iter(sources, targets=None, pivot=None):
 
     if targets and pivot < len(targets):
         pivot_freq = targets[pivot]
-        source_pivot = bisect.bisect_left(sources, pivot_freq)
+        # source_pivot = bisect.bisect_left(sources, pivot_freq)
     elif pivot == -1:
-        source_pivot = -1
+        # source_pivot = -1
+        pivot_freq = sources[-1]
     else:
-        source_pivot = 0
+        # source_pivot = 0
+        pivot_freq = sources[0]
+    # ordered by distance. This is generally fair; it favours same and near band.
+    return sorted(sources, key=lambda x: abs(x - pivot_freq))
 
-    low = list(reversed(sources[0:source_pivot]))
-    high = sources[source_pivot:]
-    if not targets:
-        zipper = []
-    elif (pivot % len(targets)) >= len(targets) // 2:
-        zipper = itertools.zip_longest(high, low)
-    else:
-        zipper = itertools.zip_longest(low, high)
-    for next_freqs in zipper:
-        yield from next_freqs
+    # low = list(reversed(sources[0:source_pivot]))
+    # high = sources[source_pivot:]
+    # if not targets:
+    #     zipper = []
+    # elif (pivot % len(targets)) >= len(targets) // 2:
+    #     zipper = itertools.zip_longest(high, low)
+    # else:
+    #     zipper = itertools.zip_longest(low, high)
+    # for next_freqs in zipper:
+    #     yield from next_freqs
+
+
+def ordered_by_distance(data, origin):
+    return 
 
 
 class FrequencyPool:
@@ -518,7 +542,7 @@ class FrequencyPool:
 
     def add_stations(self, stations, pivot=None):
         for station in stations:
-            self.extend(station, pivot)
+            self.extend(station.frequencies, pivot)
 
     def can_cover_bandwidth(self, frequency, others):
         return (
@@ -541,36 +565,23 @@ def sample_rate_for(sample_size, sample_rates):
 
 
 class HFDLListener:
-    # Set this to your airframes.io station name.
-    # Usual format is "<2-initals>-<nearest ICAO airport code><index>-HFDL"
-    # Can be passed as the environment variable `DUMPHFDL_STATION_ID`
-    station_id = None
-    # The --antenna parameter for `dumphfdl`. Can be passed as environment variable `DUMPHFDL_ANTENNA`
-    antenna = None
-    # If you use a statsd server, set this to "<host>:<port>". As `--statsd` param, or `DUMPHFDL_STATSD` env var.
     statsd_server = None
-    # --quiet flag will suppress logging of packets to stdout
     quiet = False
-    system_table = None
-    system_table_save = None
     log_path = None
     sdr_settle = 5
-    soapysdr = None
-    device_settings = None
     acars_hub = None
     ground_stations = None
     ground_station_updater = None
     sample_rates = None
-    gain = None
-    gain_elements = None
     killed = False
     tempdirname = None
     _fifo = None
 
-    def __init__(self, ground_stations, sample_rates):
+    def __init__(self, ground_stations, sample_rates, **dumphfdl_opts):
         self.process = None
         self.ground_stations = ground_stations
         self.sample_rates = sample_rates
+        self.dumphfdl_opts = dumphfdl_opts
 
     @property
     def fifo(self):
@@ -583,44 +594,40 @@ class HFDLListener:
         return pathlib.Path(f'{DUMB_SHARE_PATH}') / 'current.log'
 
     def command(self, frequencies):
-        #
-        # If you use a different configuration, you'll have to adjust these to match your system.
         sample_rate = sample_rate_for(int(bandwidth_for_interval(frequencies) / FILTER_FACTOR), self.sample_rates)
         dump_cmd = [
             'dumphfdl',
             '--sample-rate', str(sample_rate),
         ]
-        if self.device_settings:
-            dump_cmd.extend(['--device-settings', self.device_settings,])
-        if self.soapysdr:
-            dump_cmd.extend(['--soapysdr', self.soapysdr,])
-        if self.gain_elements:
-            dump_cmd.extend(['--gain-elements', self.gain_elements])
-        if self.gain:
-            dump_cmd.extend(['--gain', self.gain])
+        opt_map = [
+            ('device_settings', 'device-settings'),
+            ('soapysdr', 'soapysdr'),
+            ('gain_elements', 'gain-elements'),
+            ('gain', 'gain'),
+            ('antenna', 'antenna'),
+            ('system_table', 'system-table'),
+            ('system_table_save', 'system-table-save'),
+            ('station_id', 'station-id'),
+        ]
+        for from_opt, to_opt in opt_map:
+            value = self.dumphfdl_opts.get(from_opt, None)
+            if value is not None:
+                dump_cmd.extend([f'--{to_opt}', str(value)])
         if not self.quiet:
             dump_cmd.extend(['--output', 'decoded:text:file:path=/dev/stdout',])
-        if self.antenna:
-            dump_cmd.extend(['--antenna', f'Antenna {self.antenna}',])
         if self.statsd_server:
             dump_cmd.extend([
                 '--statsd', self.statsd_server,
                 '--noise-floor-stats-interval', '30',
             ])
-        if self.system_table:
-            dump_cmd.extend(['--system-table', self.system_table,])
-        if self.system_table_save:
-            dump_cmd.extend(['--system-table-save', self.system_table_save,])
-        if self.station_id:
-            dump_cmd.extend(['--station-id', self.station_id,])
         if self.acars_hub:
             host, port = self.acars_hub.split(':')
             dump_cmd.extend(['--output', f'decoded:json:tcp:address={host},port={port}'])
-        elif self.station_id:
+        elif self.dumphfdl_opts.get('station_id'):
             dump_cmd.extend(['--output', 'decoded:json:tcp:address=feed.airframes.io,port=5556',])
         if self.log_path:
             dump_cmd.extend(['--output', f'decoded:json:file:path={self.log_path}/hfdl.json.log,rotate=daily',])
-        # special file for ground_station_updater.
+        # special pipe for ground_station_updater.
         dump_cmd.extend(['--output', f'decoded:json:file:path={self.fifo}'])
         for output in json.loads(os.getenv('DUMPHFDL_OUTPUTS', '[]')):
             dump_cmd.extend(['--output', output])
@@ -659,7 +666,7 @@ class HFDLListener:
             await self.start(frequencies)
             logger.info("restarted")
             self.ground_station_updater = SquitterWatcher(self.fifo, self.ground_stations.merge_packet)
-            asyncio.ensure_future(self.ground_station_updater.run())
+            loop.create_task(self.ground_station_updater.run())
 
         def exited(self, _=None):
             loop.create_task(actual_restart(_))
@@ -686,29 +693,29 @@ class HFDLListener:
             self.process = None
 
 
-async def busy():
-    while True:
-        await asyncio.sleep(1)
-
-
 def split_stations(stations):
+    raw_ids = []
     if not stations or stations == '.':
-        return []
+        return raw_ids
     if stations.startswith('['):
         # could be JSON
         try:
-            return json.loads(stations)
+            raw_ids = json.loads(stations)
         except json.JSONDecodeError:
             pass
-    if '+' in stations or ';' in stations:
-        return re.split('[+;]', stations)
-    s = stations.split(',')
-    # it could still be a station name, not an id.
-    try:
-        int(s[0])
-    except ValueError:
+    elif '+' in stations or ';' in stations:
+        raw_ids = re.split('[+;]', stations)
+    raw_ids = stations.split(',')
+    ids = []
+    for x in raw_ids:
+        try:
+            ids.append(int(x))
+        except ValueError:
+            pass
+    if len(ids) == 2 and all(not isinstance(x, int) for x in ids):
+        # it could still be a station name, not an id.
         return stations
-    return s
+    return ids
 
 
 def common_params(func):
@@ -735,39 +742,34 @@ def main(ctx):
 @main.command()
 @common_params
 @click.option('-s', '--station-id', default=os.getenv('DUMPHFDL_STATION_ID'))
-@click.option('--antenna', default=os.getenv('DUMPHFDL_ANTENNA'))
-@click.option('--statsd', default=os.getenv('DUMPHFDL_STATSD'))
 @click.option('--quiet', help='Suppress packet logging to stdout.', is_flag=True)
-@click.option('--system-table', default=os.getenv('DUMPHFDL_SYSTABLE', SYSTABLE_LOCATION))
-@click.option('--system-table-save', default=os.getenv('DUMPHFDL_SYSTABLE_UPDATES', SYSTABLE_UPDATES_PATH))
-@click.option('--log-path', default=os.getenv('DUMPHFDL_LOG_PATH', LOG_PATH))
 @click.option('--watch-interval', default=os.getenv('DUMPHFDL_WATCH_INTERVAL', WATCH_INTERVAL))
 @click.option('--sdr-settle', default=int(os.getenv('DUMPHFDL_SDR_SETTLE', SDR_SETTLE_TIME)))
-@click.option('--soapysdr', default=os.getenv('DUMPHFDL_SOAPYSDR'))
-@click.option('--device-settings', default=os.getenv('DUMPHFDL_DEVICE_SETTINGS'))
+@click.option('--log-path', default=os.getenv('DUMPHFDL_LOG_PATH', LOG_PATH))
 @click.option('--acars-hub', default=os.getenv('DUMPHFDL_ACARS_HUB'))
+@click.option('--statsd', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_STATSD'))
+@click.option('--soapysdr', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_SOAPYSDR'))
+@click.option('--antenna', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_ANTENNA'))
+@click.option('--device-settings', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_DEVICE_SETTINGS'))
+@click.option('--system-table', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_SYSTABLE', SYSTABLE_LOCATION))
+@click.option(
+    '--system-table-save', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_SYSTABLE_UPDATES', SYSTABLE_UPDATES_PATH)
+)
+@click.option('--gain', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_GAIN'))
+@click.option('--gain-elements', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_GAIN_ELEMENTS'))
 def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, sample_rates,
-        station_id, antenna, statsd, quiet, system_table, system_table_save, log_path,
-        watch_interval, sdr_settle, soapysdr, device_settings, acars_hub
+        statsd, quiet, log_path, watch_interval, sdr_settle,acars_hub,
+        **dumphfdl_opts
     ):
-
     ground_stations = GroundStations(gs_cache)
     sample_rates = sorted(int(x) for x in sample_rates.split(',') if x)
 
-    listener = HFDLListener(ground_stations, sample_rates)
-    listener.station_id = station_id
-    listener.antenna = antenna
+    listener = HFDLListener(ground_stations, sample_rates, **dumphfdl_opts)
     listener.statsd_server = statsd
     listener.quiet = quiet
-    listener.system_table = system_table
-    listener.system_table_save = system_table_save
     listener.log_path = log_path
     listener.sdr_settle = sdr_settle
-    listener.soapysdr = soapysdr
-    listener.device_settings = device_settings
     listener.acars_hub = acars_hub
-    listener.gain = os.getenv('DUMPHFDL_GAIN')
-    listener.gain_elements = os.getenv('DUMPHFDL_GAIN_ELEMENTS')
 
     def frequencies_updated(new_frequencies):
         logger.info(f'frequencies: {new_frequencies} = {bandwidth_for_interval(new_frequencies)}')
@@ -820,10 +822,12 @@ def scan(
     watcher.max_sample_size = max_samples
     watcher.sample_rates = sample_rates
     watcher.set_ignore_ranges(ignore_ranges)
+    assert watcher.core_ids, 'No core stations identified'
+    logger.debug(f'core ids = {core_ids} / {watcher.core_ids}')
 
     freqs = watcher.refresh()
     bandwidth = int(bandwidth_for_interval(freqs))
-    samples = int(bandwidth / 0.8)
+    samples = int(bandwidth / FILTER_FACTOR)
     sample_rate = sample_rate_for(samples, watcher.sample_rates)
     watcher.experimental_pools()
     logger.info(f"Best Frequencies: {freqs}")
