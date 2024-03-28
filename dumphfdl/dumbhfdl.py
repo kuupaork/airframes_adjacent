@@ -706,7 +706,7 @@ class HFDLListener:
             self.process = None
 
     async def watch_stderr(self, stream):
-        errors = ['^Unable to initialize input', '^Sample buffer overrun']
+        errors = ['^Unable to initialize input']  # , '^Sample buffer overrun']
         async for data in stream:
             await asyncio.sleep(0)
             if not self.process:
