@@ -7,6 +7,7 @@
 import asyncio.subprocess
 import bisect
 import collections
+import contextlib
 import datetime
 import functools
 import itertools
@@ -31,6 +32,7 @@ import fallback
 
 logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s')
 logger = logging.getLogger(sys.argv[0].rsplit('/', 1)[-1].rsplit('.', 1)[0] if __name__ == '__main__' else __name__)
+dumphfdl_logger = logging.getLogger('dumphfdl')
 
 # The maximum practical kSamples/sec to accept. For my RSPdx, the technical limit is 10000 (10MS/s) but practical
 # experimentation shows that using this rate causes occasional data streaming errors, so I back it off a little bit
@@ -153,7 +155,7 @@ class GroundStation:
         return f'#{self.gsid}. {self.name} ({",".join(str(f) for f in self.frequencies)})'
 
 
-class GroundStations:
+class GroundStationCache:
     path = None
 
     def __init__(self, path=None):
@@ -253,8 +255,8 @@ class GroundStationWatcher:
     _max_sample_size = 20000
     _sample_rates = None
 
-    def __init__(self, ground_stations, on_update=None):
-        self.ground_stations = ground_stations
+    def __init__(self, ground_station_cache, on_update=None):
+        self.ground_station_cache = ground_station_cache
         self.task = None
         self.on_update = on_update
         self.last = []
@@ -276,7 +278,9 @@ class GroundStationWatcher:
         while True:
             logger.info("refreshing")
             self.refresh()
-            await asyncio.sleep(self.watch_interval)
+            for i in range(self.watch_interval // 10):
+                logger.debug(f'tick {i}')
+                await asyncio.sleep(10)
 
     def remote(self, url):
         data = {}
@@ -289,14 +293,14 @@ class GroundStationWatcher:
         return data
 
     def parse_airframes(self, data):
-        stations = GroundStations()  # in-memory only
+        stations = GroundStationCache()  # in-memory only
         stations.merge_airframes(data)
         return stations
 
     def refresh(self):
         sources = [
             ('Airframes Ground Station URL', lambda: self.remote(GROUND_STATION_URL)),
-            ('Cached Squitter Data', lambda: self.ground_stations.pruned_dict()),
+            ('Cached Squitter Data', lambda: self.ground_station_cache.pruned_dict()),
             ('Backup Ground Station URL', lambda: self.remote(os.getenv('DUMPHFDL_BACKUP_URL'))),
             ('All Allocated Frequencies', lambda: fallback.ALL_FREQUENCIES),
         ]
@@ -306,7 +310,7 @@ class GroundStationWatcher:
             parsed = self.parse_airframes(ground_station_data)
             if all(parsed.frequencies(core_id) for core_id in self.core_ids):
                 logger.info(f'Using {name}')
-                self.ground_stations.merge(parsed)
+                self.ground_station_cache.merge(parsed)
                 return self.choose_best_frequencies()
             else:
                 logger.info(f'Cannot update from {name}')
@@ -370,7 +374,7 @@ class GroundStationWatcher:
           there's a lot of noise and not much signal below 6MHz, so I've marked that range as ignored and it works well
         """
         # build core range
-        core_stations = [self.ground_stations[n] for n in self.core_ids]
+        core_stations = [self.ground_station_cache[n] for n in self.core_ids]
         low_pool = self.create_pool()
         low_pool.add_stations(core_stations, pivot=0)
         low = list(low_pool)
@@ -384,12 +388,12 @@ class GroundStationWatcher:
 
         # Fringe stations don't determine pool range, but fill in frequencies more likely to be heard
         # don't need pivot here.
-        actual_pool.add_stations(self.ground_stations[n] for n in self.fringe_ids)
+        actual_pool.add_stations(self.ground_station_cache[n] for n in self.fringe_ids)
 
         # now fill in the others "just in case"
         if not self.skip_fill:
             # a bit wasteful, but these are all small enough that completely readding everything won't hurt.
-            actual_pool.add_stations(self.ground_stations.stations)
+            actual_pool.add_stations(self.ground_station_cache.stations)
         return actual_pool
 
     def experimental_pools(self):
@@ -399,7 +403,7 @@ class GroundStationWatcher:
             # "middle pool" works a bit differently to the high and low pools above. Instead of ranking the Core
             # stations, it combines all their frequencies into a single group. It takes the middle entry from the
             # list and works outwards from it until the bandwidth is filled.
-            core_stations = [self.ground_stations.frequencies(n) for n in self.core_ids]
+            core_stations = [self.ground_station_cache.frequencies(n) for n in self.core_ids]
             core_freqs = sorted(itertools.chain(*core_stations))
             middle_pool = self.create_pool()
             middle_pool.extend(core_freqs)
@@ -409,7 +413,7 @@ class GroundStationWatcher:
             # "iterate core" is similar to "middle pool", but instead of picking just one frequency to build out from,
             # each "core" frequency is tried in turn, building a pool outward from it. The unique pools generated by
             # this mechanism are yielded.
-            core_station_active = [self.ground_stations.frequencies(n) for n in self.core_ids]
+            core_station_active = [self.ground_station_cache.frequencies(n) for n in self.core_ids]
             core_freqs = sorted(itertools.chain(*core_station_active))
             seen = []
             for ix in range(0, len(core_freqs)):
@@ -429,33 +433,52 @@ class GroundStationWatcher:
             logger.info('===')
 
 
-class SquitterWatcher:
+class PacketWatcher:
+    task = None
+    enabled = False
+
     def __init__(self, fifo, on_update=None):
         self.fifo = pathlib.Path(fifo)
         self.on_update = on_update or self.default_update
-        self.enabled = False
 
     async def run(self):
         self.enabled = True
         logger.debug(f'watching for squitters and frequency updates')
         await self.watch_fifo(self.fifo)
 
+    def start(self):
+        self.task = loop.create_task(self.run())
+
+    def stop(self):
+        self.enabled = False
+        if self.task:
+            self.task.cancel()
+            self.task = None
+
     async def watch_fifo(self, fifo):
         while self.enabled and not fifo.exists():
+            logger.info(f'waiting for fifo {fifo}')
             await asyncio.sleep(1)
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
         with open(fifo) as pipe:
-            await loop.connect_read_pipe(lambda: protocol, pipe)
-            async for data in reader:
-                line = data.decode('utf8')
-                if line:
-                    if '"gs_status"' in line:
-                        packet = json.loads(line)
-                        self.on_update(packet)
-                    elif '"Frequency data"' in line:
-                        packet = json.loads(line)
-                        self.on_update(packet)
+            try:
+                await loop.connect_read_pipe(lambda: protocol, pipe)
+                async for data in reader:
+                    await asyncio.sleep(0)
+                    if not self.enabled:
+                        break
+                    line = data.decode('utf8')
+                    if line:
+                        if '"gs_status"' in line:
+                            packet = json.loads(line)
+                            self.on_update(packet)
+                        elif '"Frequency data"' in line:
+                            packet = json.loads(line)
+                            self.on_update(packet)
+            except asyncio.CancelledError:
+                logger.info('packet watcher cancelled')
+            logger.info('packet watcher completed')
 
     def default_update(self, update):
         logger.info(update)
@@ -564,36 +587,36 @@ def sample_rate_for(sample_size, sample_rates):
     return sample_rates[ix]
 
 
+@contextlib.contextmanager
+def temp_fifo():
+    with tempfile.TemporaryDirectory() as dirname:
+        fifo = pathlib.Path(f'{dirname}/dumphfdl.pipe')
+        os.mkfifo(fifo)
+        yield fifo
+        logger.debug('fifo done')
+        # polite to unlink, but likely not strictly necessary.
+        fifo.unlink()
+
+
 class HFDLListener:
     statsd_server = None
     quiet = False
     log_path = None
     sdr_settle = 5
     acars_hub = None
-    ground_stations = None
-    ground_station_updater = None
+    ground_station_cache = None
     sample_rates = None
     killed = False
-    tempdirname = None
-    _fifo = None
+    dumphfdl_task = None
+    process = None
+    packet_watcher = None
 
-    def __init__(self, ground_stations, sample_rates, **dumphfdl_opts):
-        self.process = None
-        self.ground_stations = ground_stations
+    def __init__(self, ground_station_cache, sample_rates, **dumphfdl_opts):
+        self.ground_station_cache = ground_station_cache
         self.sample_rates = sample_rates
         self.dumphfdl_opts = dumphfdl_opts
 
-    @property
-    def fifo(self):
-        if self._fifo and self._fifo.exists():
-            return self._fifo
-        if self.tempdirname:
-            self._fifo = pathlib.Path(f'{self.tempdirname}/dumphfdl.pipe')
-            os.mkfifo(self._fifo)
-            return self._fifo
-        return pathlib.Path(f'{DUMB_SHARE_PATH}') / 'current.log'
-
-    def command(self, frequencies):
+    def dumphfdl_commandline(self, frequencies):
         sample_rate = sample_rate_for(int(bandwidth_for_interval(frequencies) / FILTER_FACTOR), self.sample_rates)
         dump_cmd = [
             'dumphfdl',
@@ -634,63 +657,68 @@ class HFDLListener:
         dump_cmd += [str(f) for f in frequencies]
         return dump_cmd
 
-    def on_exit(self):
-        return asyncio.ensure_future(self.process.wait())
-
-    def stop(self):
-        logger.info("stopping")
-        if self.process:
-            self.process.send_signal(signal.SIGKILL)
-
-    async def start(self, frequencies):
-        logger.info("starting")
+    def listen(self, frequencies):
         self.frequencies = frequencies
-        cmd = self.command(frequencies)
-        logger.debug(cmd)
-        if self.ground_station_updater:
-            self.ground_station_updater.enabled = False
-        if self.fifo and self.fifo.exists():
-            self.fifo.unlink()
-        self.process = await asyncio.create_subprocess_exec(*cmd)
-        # if/when we become interested in looking for errors in output...
-        # stdout=asyncio.subprocess.PIPE
-        # stderr=asyncio.subprocess.PIPE
-        self.on_exit().add_done_callback(self.exited)
-        return self.process.returncode  # `None` if still running
-
-    async def restart(self, frequencies):
-        async def actual_restart(_=None):
-            logger.info("SDR settling")
-            await asyncio.sleep(self.sdr_settle)
-            logger.info("SDR settled")
-            await self.start(frequencies)
-            logger.info("restarted")
-            self.ground_station_updater = SquitterWatcher(self.fifo, self.ground_stations.merge_packet)
-            loop.create_task(self.ground_station_updater.run())
-
-        def exited(self, _=None):
-            loop.create_task(actual_restart(_))
-
-        logger.info("restarting")
-        if self.process:
-            self.on_exit().add_done_callback(exited)
-            self.stop()
+        if self.dumphfdl_task:
+            self.terminate()
         else:
-            await actual_restart()
+            self.dumphfdl_task = loop.create_task(self.run())
 
-    def exited(self, _=None):
-        # here we might do some post-mortem, but nothing for now.
-        self.process = None
-        logger.info("exited")
-        if not self.killed:
-            logger.info("restarting from unexpected exit")
-            loop.create_task(self.restart(self.frequencies))
+    async def run(self):
+        while not self.killed:
+            with temp_fifo() as fifo:
+                logger.debug(f'with fifo {fifo}')
+                self.fifo = fifo
+                if self.packet_watcher:
+                    logger.debug('cleaning up old packet watcher')
+                    self.packet_watcher.stop()
+                if self.process:  # dubious, but this is the old process, which should have been nulled out
+                    logger.info('giving SDR a chance to settle')
+                    await asyncio.sleep(self.sdr_settle)
+                logger.info(f'gathering options for {self.frequencies}')
+                cmd = self.dumphfdl_commandline(self.frequencies)
+                logger.debug(cmd)
+                logger.info('starting dumphfdl')
+                self.process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
+                logger.debug(f'process started {self.process}')
+                logger.info(f'starting packet watcher')
+                self.packet_watcher = PacketWatcher(fifo, self.ground_station_cache.merge_packet)
+                self.packet_watcher.start()
+                logger.info(f'starting error watcher')
+                loop.create_task(self.watch_stderr(self.process.stderr))
+
+                await self.process.wait()
+
+                logger.info('dumphfdl process finished')
+                self.process = None
+                self.packet_watcher.stop()
+
+    def terminate(self):
+        if self.process:
+            logger.info(f'stopping dumphfdl')
+            self.process.terminate()
 
     def kill(self):
         if self.process:
+            logger.warning('killing dumphfdl')
             self.killed = True
-            self.process.terminate()
+            self.process.kill()
             self.process = None
+
+    async def watch_stderr(self, stream):
+        errors = ['^Unable to initialize input', '^Sample buffer overrun']
+        async for data in stream:
+            await asyncio.sleep(0)
+            if not self.process:
+                break
+            line = data.decode('utf8').rstrip()
+            dumphfdl_logger.info(line)
+            if any(re.search(pattern, line) for pattern in errors):
+                logger.warning(f'encountered error: "{line}". Restarting')
+                # force restart
+                self.kill()
+                break
+        logger.info(f'finished watching {stream}')
 
 
 def split_stations(stations):
@@ -761,10 +789,10 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, s
         statsd, quiet, log_path, watch_interval, sdr_settle,acars_hub,
         **dumphfdl_opts
     ):
-    ground_stations = GroundStations(gs_cache)
+    ground_station_cache = GroundStationCache(gs_cache)
     sample_rates = sorted(int(x) for x in sample_rates.split(',') if x)
 
-    listener = HFDLListener(ground_stations, sample_rates, **dumphfdl_opts)
+    listener = HFDLListener(ground_station_cache, sample_rates, **dumphfdl_opts)
     listener.statsd_server = statsd
     listener.quiet = quiet
     listener.log_path = log_path
@@ -773,9 +801,9 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, s
 
     def frequencies_updated(new_frequencies):
         logger.info(f'frequencies: {new_frequencies} = {bandwidth_for_interval(new_frequencies)}')
-        loop.create_task(listener.restart(new_frequencies))
+        listener.listen(new_frequencies)
 
-    watcher = GroundStationWatcher(ground_stations, frequencies_updated)
+    watcher = GroundStationWatcher(ground_station_cache, frequencies_updated)
     watcher.core_ids = split_stations(core_ids)
     watcher.fringe_ids = split_stations(fringe_ids)
     watcher.skip_fill = skip_fill
@@ -784,17 +812,15 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, s
     watcher.sample_rates = sample_rates
     watcher.set_ignore_ranges(ignore_ranges)
 
-    with tempfile.TemporaryDirectory() as tempdirname:
-        listener.tempdirname = tempdirname
-        try:
-            loop.run_until_complete(watcher.run())
-        except asyncio.CancelledError:
-            listener.kill()
-        except KeyboardInterrupt:
-            listener.kill()
-        except:
-            listener.kill()
-            raise
+    try:
+        loop.run_until_complete(watcher.run())
+    except asyncio.CancelledError:
+        listener.kill()
+    except KeyboardInterrupt:
+        listener.kill()
+    except:
+        listener.kill()
+        raise
 
 
 @main.command()
@@ -812,10 +838,10 @@ def scan(
         FRINGE_STATIONS = []
     FILL_OTHER_STATIONS = not (named or core)
 
-    ground_stations = GroundStations(gs_cache)
+    ground_station_cache = GroundStationCache(gs_cache)
     sample_rates = sorted(int(x) for x in sample_rates.split(',') if x)
 
-    watcher = GroundStationWatcher(ground_stations)
+    watcher = GroundStationWatcher(ground_station_cache)
     watcher.core_ids = split_stations(core_ids)
     watcher.fringe_ids = split_stations(fringe_ids)
     watcher.skip_fill = skip_fill
