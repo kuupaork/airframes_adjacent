@@ -718,8 +718,8 @@ class HFDLListener:
                     await asyncio.sleep(self.sdr_settle)
                 logger.info(f'gathering options for {self.frequencies}')
                 cmd = self.dumphfdl_commandline(self.frequencies)
-                logger.debug(cmd)
                 logger.info('starting dumphfdl')
+                logger.debug(f'$ `{" ".join(cmd)}`')
                 self.process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
                 logger.debug(f'process started {self.process}')
                 logger.info('starting packet watcher')
@@ -754,9 +754,6 @@ class HFDLListener:
     async def watch_stderr(self, stream):
         errors = ['^Unable to initialize input']  # , '^Sample buffer overrun']
         async for data in stream:
-            await asyncio.sleep(0)
-            if not self.process:
-                break
             line = data.decode('utf8').rstrip()
             dumphfdl_logger.info(line)
             if any(re.search(pattern, line) for pattern in errors):
@@ -764,6 +761,9 @@ class HFDLListener:
                 # force restart
                 self.kill()
                 break
+            if not self.process:
+                break
+            await asyncio.sleep(0)
         logger.info(f'finished watching {stream}')
 
 
