@@ -729,7 +729,11 @@ class HFDLListener:
                 logger.info(f'starting error watcher')
                 loop.create_task(self.watch_stderr(self.process.stderr))
 
-                await self.process.wait()
+                try:
+                    await self.process.wait()
+                except Exception as e:
+                    logger.error(f'Process aborted: {e}')
+                    sys.exit(1)
 
                 logger.info('dumphfdl process finished')
                 self.process = None
