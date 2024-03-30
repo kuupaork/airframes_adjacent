@@ -24,7 +24,7 @@ cp airspy.hf .env
 
 Edit the `.env` file in your favourite text editor, following the minimal instructions in it, or the more complete ones in the `README.md` file
 
-Once you're comfortable, you can run
+Once you're comfortable with your configuration, you can run
 
 ```
 ./dumbhfdl.sh

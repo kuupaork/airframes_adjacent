@@ -82,6 +82,9 @@ SYSTABLE_UPDATES_PATH = f'{DUMB_SHARE_PATH}/hfdl-systable-new.conf'
 # Override with `--log-path` option or the `DUMPHFDL_LOG_PATH` environment variable.
 LOG_PATH = DUMB_SHARE_PATH / "logs"
 
+# 3 station updates per squitter means it takes 6 squitters to fully update. 1 squitter per HFDL frame (32s).
+SQUITTER_FRAME_TIME = 6 * 32 *2  # update only ever other squitter pseudoframe
+
 
 def bandwidth_for_interval(interval):
     return interval[-1] - interval[0]
@@ -94,21 +97,31 @@ class GroundStation:
     name = None
     gsid = "unknown"
 
+    def __init__(self):
+        try:
+            self.stats = collections.defaultdict(lambda: 0)
+        except Exception as e:
+            logger.error(f'{e}')
+            raise
+
     def __setattr__(self, name, value):
         oldval = getattr(self, name, object())
         super().__setattr__(name, value)
-        if name != 'dirty' and value != oldval:
+        if name in ('last_updated', 'frequencies', 'name', 'gsid') and value != oldval:
             super().__setattr__('dirty', True)
 
+    def is_new_pseudoframe(self, timestamp):
+        return (self.last_updated // SQUITTER_FRAME_TIME) < (timestamp // SQUITTER_FRAME_TIME)
+
     def update_from_station(self, data):
-        if data.last_updated > self.last_updated:
+        if self.is_new_pseudoframe(data.last_updated):
             self.last_updated = data.last_updated
             self.gsid = data.gsid
             self.name = data.name
             self.frequencies = data.frequencies
 
     def update_from_airframes(self, data, mark_clean=False):
-        if data['last_updated'] > self.last_updated:
+        if self.is_new_pseudoframe(data['last_updated']):
             self.last_updated = data['last_updated']
             self.gsid = data['id']
             self.name = data['name']
@@ -118,7 +131,7 @@ class GroundStation:
                 self.mark_clean()
 
     def update_from_squitter(self, data, last_updated):
-        if last_updated > self.last_updated:
+        if self.is_new_pseudoframe(last_updated):
             self.last_updated = last_updated
             self.gsid = data['gs']['id']
             self.name = data['gs']['name']
@@ -126,7 +139,7 @@ class GroundStation:
             logger.debug(f'squitter update for {self}')
 
     def update_from_hfnpdu(self, data, last_updated):
-        if not self.last_updated:
+        if not self.last_updated:  # packets only used to backfill missing stations.
             self.last_updated = last_updated
             self.gsid = data['gs']['id']
             self.name = data['gs']['name']
@@ -162,6 +175,7 @@ class GroundStationCache:
         self.stations_by_id = collections.defaultdict(GroundStation)
         self.stations_by_name = {}
         self.last = None
+        self.stats = collections.defaultdict(lambda: 0)
         if (path):
             self.path = pathlib.Path(path)
             self.load()
@@ -201,10 +215,17 @@ class GroundStationCache:
     def merge_packet(self, packet):
         hfdl = packet.get('hfdl', {})
         last_updated = hfdl.get('t', {}).get('sec', 0)
+        squitters = hfnpdu = 0
         for station in hfdl.get('spdu', {}).get('gs_status', []):
             self[station['gs']['id']].update_from_squitter(station, last_updated)
+            squitters = 1
         for station in hfdl.get('lpdu', {}).get('hfnpdu', {}).get('freq_data', []):
             self[station['gs']['id']].update_from_hfnpdu(station, last_updated)
+            hfnpdu = 1
+        self.stats['hfnpdu'] += hfnpdu
+        logger.debug(f'hfnpdu seen: {self.stats["hfnpdu"]}')
+        self.stats['squitter'] += squitters
+        logger.debug(f'squitters seen: {self.stats["squitter"]}')
         self.update_lookups()
         self.prune_expired()
         self.save()
@@ -245,6 +266,10 @@ class GroundStationCache:
     @property
     def stations(self):
         return self.stations_by_id.values()
+
+    def subscribe_to_packet_watcher(self, packet_watcher):
+        packet_watcher.add_in_subscriber(self.merge_packet, '"gs_status"', '"Frequency data"')
+        # add vote gathering tracking later.
 
 
 class GroundStationWatcher:
@@ -437,13 +462,30 @@ class PacketWatcher:
     task = None
     enabled = False
 
-    def __init__(self, fifo, on_update=None):
+    def __init__(self, fifo):
         self.fifo = pathlib.Path(fifo)
-        self.on_update = on_update or self.default_update
+        self.subscribers = []
+
+    def add_in_subscriber(self, callback, *required_text):
+        def _filter(raw, text):
+            for needle in required_text:
+                if needle in raw:
+                    return True
+            return False
+        self.add_subscriber(_filter, callback)
+
+    def add_subscriber(self, _filter, callback):
+        self.subscribers.append((_filter, callback))
+
+    def publish(self, raw):
+        packet = json.loads(raw)
+        for _filter, callback in self.subscribers:
+            if _filter(raw, packet):
+                callback(packet)
 
     async def run(self):
         self.enabled = True
-        logger.debug(f'watching for squitters and frequency updates')
+        logger.debug(f'watching for squitters and frequency updates on {self.fifo}')
         await self.watch_fifo(self.fifo)
 
     def start(self):
@@ -456,29 +498,29 @@ class PacketWatcher:
             self.task = None
 
     async def watch_fifo(self, fifo):
-        while self.enabled and not fifo.exists():
-            logger.info(f'waiting for fifo {fifo}')
-            await asyncio.sleep(1)
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        with open(fifo) as pipe:
-            try:
-                await loop.connect_read_pipe(lambda: protocol, pipe)
-                async for data in reader:
-                    await asyncio.sleep(0)
-                    if not self.enabled:
-                        break
-                    line = data.decode('utf8')
-                    if line:
-                        if '"gs_status"' in line:
-                            packet = json.loads(line)
-                            self.on_update(packet)
-                        elif '"Frequency data"' in line:
-                            packet = json.loads(line)
-                            self.on_update(packet)
-            except asyncio.CancelledError:
-                logger.info('packet watcher cancelled')
-            logger.info('packet watcher completed')
+        try:
+            while self.enabled and not fifo.exists():
+                logger.info(f'waiting for fifo {fifo}')
+                await asyncio.sleep(1)
+            reader = asyncio.StreamReader()
+            protocol = asyncio.StreamReaderProtocol(reader)
+            with open(fifo) as pipe:
+                try:
+                    await loop.connect_read_pipe(lambda: protocol, pipe)
+                    async for data in reader:
+                        await asyncio.sleep(0)
+                        if not self.enabled:
+                            break
+                        line = data.decode('utf8')
+                        if line:
+                            self.publish(line)
+                except asyncio.CancelledError:
+                    logger.info('packet watcher cancelled')
+                    raise
+                logger.info('packet watcher completed')
+        except Exception as e:
+            logger.error(e)
+            sys.exit(1)
 
     def default_update(self, update):
         logger.info(update)
@@ -672,7 +714,6 @@ class HFDLListener:
                 if self.packet_watcher:
                     logger.debug('cleaning up old packet watcher')
                     self.packet_watcher.stop()
-                if self.process:  # dubious, but this is the old process, which should have been nulled out
                     logger.info('giving SDR a chance to settle')
                     await asyncio.sleep(self.sdr_settle)
                 logger.info(f'gathering options for {self.frequencies}')
@@ -681,8 +722,9 @@ class HFDLListener:
                 logger.info('starting dumphfdl')
                 self.process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
                 logger.debug(f'process started {self.process}')
-                logger.info(f'starting packet watcher')
-                self.packet_watcher = PacketWatcher(fifo, self.ground_station_cache.merge_packet)
+                logger.info('starting packet watcher')
+                self.packet_watcher = PacketWatcher(fifo)
+                self.ground_station_cache.subscribe_to_packet_watcher(self.packet_watcher)
                 self.packet_watcher.start()
                 logger.info(f'starting error watcher')
                 loop.create_task(self.watch_stderr(self.process.stderr))

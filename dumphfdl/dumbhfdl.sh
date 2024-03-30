@@ -13,4 +13,5 @@ if ! [[ -r $(which dumphfdl) ]] ; then
     echo added local bin path
 fi
 
+pkill dumphfdl
 ./dumbhfdl.py
