@@ -726,10 +726,10 @@ class HFDLListener:
                 self.packet_watcher = PacketWatcher(fifo)
                 self.ground_station_cache.subscribe_to_packet_watcher(self.packet_watcher)
                 self.packet_watcher.start()
-                logger.info(f'starting error watcher')
-                loop.create_task(self.watch_stderr(self.process.stderr))
 
                 try:
+                    logger.info(f'starting error watcher')
+                    loop.create_task(self.watch_stderr(self.process.stderr))
                     await self.process.wait()
                 except Exception as e:
                     logger.error(f'Process aborted: {e}')
