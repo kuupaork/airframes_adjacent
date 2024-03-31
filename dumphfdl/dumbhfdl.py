@@ -96,6 +96,8 @@ class GroundStation:
     dirty = False
     name = None
     gsid = "unknown"
+    uplink_packets = 0
+    downlink_packets = 0
 
     def __init__(self):
         try:
@@ -146,6 +148,12 @@ class GroundStation:
             self.frequencies = sorted(map(int, (sf['freq'] for sf in data['heard_on_freqs'])))
             logger.debug(f'hfnpdu update for {self}')
 
+    def rate_uplink_packet(self, packet):
+        self.uplink_packets += 1
+
+    def rate_downlink_packet(self, packet):
+        self.downlink_packets += 1
+
     def dict(self):
         return {
             'id': self.gsid,
@@ -165,7 +173,10 @@ class GroundStation:
         return self.last_updated >= horizon and self.frequencies
 
     def __str__(self):
-        return f'#{self.gsid}. {self.name} ({",".join(str(f) for f in self.frequencies)})'
+        return (
+            f'#{self.gsid}. {self.name} ({",".join(str(f) for f in self.frequencies)})' + 
+            f' up:{self.uplink_packets} down:{self.downlink_packets}'
+        )
 
 
 class GroundStationCache:
@@ -207,13 +218,16 @@ class GroundStationCache:
 
     def merge_airframes(self, airframes, is_load=False, mark_clean=False):
         for gs in airframes.get('ground_stations', []):
-            self[gs['id']].update_from_airframes(gs, mark_clean)
+            try:
+                self[gs['id']].update_from_airframes(gs, mark_clean)
+            except KeyError:
+                log.warning(f'ignoring spurious station `{gs["id"]}')
         self.update_lookups()
         self.prune_expired()
         self.save()
 
-    def merge_packet(self, packet):
-        hfdl = packet.get('hfdl', {})
+    def merge_packet(self, hfdl_packet):
+        hfdl = hfdl_packet.packet
         last_updated = hfdl.get('t', {}).get('sec', 0)
         squitters = hfnpdu = 0
         for station in hfdl.get('spdu', {}).get('gs_status', []):
@@ -268,8 +282,15 @@ class GroundStationCache:
         return self.stations_by_id.values()
 
     def subscribe_to_packet_watcher(self, packet_watcher):
+        packet_watcher.add_subscriber(True, self.rate_packet)
         packet_watcher.add_in_subscriber(self.merge_packet, '"gs_status"', '"Frequency data"')
         # add vote gathering tracking later.
+
+    def rate_packet(self, packet):
+        if packet.is_uplink:
+            self[packet.src['id']].rate_uplink_packet(packet)
+        if packet.is_downlink:
+            self[packet.dst['id']].rate_downlink_packet(packet)
 
 
 class GroundStationWatcher:
@@ -458,6 +479,31 @@ class GroundStationWatcher:
             logger.info('===')
 
 
+class HFDLPacketInfo:
+    def __init__(self, packet):
+        # Not at all a full extraction of a packet.
+        packet = packet.get('hfdl', packet)  # in case it's not unwrapped.
+        self.packet = packet
+        self.timestamp = packet['t']['sec']
+        self.frequency = packet['freq'] // 1000
+        self.station = packet['station']
+        self.bitrate = packet.get('bitrate')
+        self.skew = packet.get('freq_skew')
+        self.frame_slot = packet.get('slot')
+        self.snr = packet['sig_level'] - packet['noise_level']
+        app_data = packet.get('spdu', packet.get('lpdu', {}))
+        self.src = app_data.get('src', {})
+        self.dst = app_data.get('dst', {})
+
+    @property
+    def is_uplink(self):
+        return self.src.get('type') == 'Ground station'
+
+    @property
+    def is_downlink(self):
+        return self.dst.get('type') == 'Ground station'
+
+
 class PacketWatcher:
     task = None
     enabled = False
@@ -479,9 +525,13 @@ class PacketWatcher:
 
     def publish(self, raw):
         packet = json.loads(raw)
+        info = HFDLPacketInfo(packet)
         for _filter, callback in self.subscribers:
-            if _filter(raw, packet):
-                callback(packet)
+            if callable(_filter):
+                if _filter(raw, packet):
+                    callback(info)
+            elif _filter is True:
+                callback(info)
 
     async def run(self):
         self.enabled = True
@@ -707,37 +757,41 @@ class HFDLListener:
             self.dumphfdl_task = loop.create_task(self.run())
 
     async def run(self):
-        while not self.killed:
-            with temp_fifo() as fifo:
-                logger.debug(f'with fifo {fifo}')
-                self.fifo = fifo
-                if self.packet_watcher:
-                    logger.debug('cleaning up old packet watcher')
+        try:
+            while not self.killed:
+                with temp_fifo() as fifo:
+                    logger.debug(f'with fifo {fifo}')
+                    self.fifo = fifo
+                    if self.packet_watcher:
+                        logger.debug('cleaning up old packet watcher')
+                        self.packet_watcher.stop()
+                        logger.info('giving SDR a chance to settle')
+                        await asyncio.sleep(self.sdr_settle)
+                    logger.info(f'gathering options for {self.frequencies}')
+                    cmd = self.dumphfdl_commandline(self.frequencies)
+                    logger.info('starting dumphfdl')
+                    logger.debug(f'$ `{" ".join(cmd)}`')
+                    self.process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
+                    logger.debug(f'process started {self.process}')
+                    logger.info('starting packet watcher')
+                    self.packet_watcher = PacketWatcher(fifo)
+                    self.ground_station_cache.subscribe_to_packet_watcher(self.packet_watcher)
+                    self.packet_watcher.start()
+
+                    try:
+                        logger.info(f'starting error watcher')
+                        loop.create_task(self.watch_stderr(self.process.stderr))
+                        await self.process.wait()
+                    except Exception as e:
+                        logger.error(f'Process aborted: {e}')
+                        sys.exit(1)
+
+                    logger.info('dumphfdl process finished')
+                    self.process = None
                     self.packet_watcher.stop()
-                    logger.info('giving SDR a chance to settle')
-                    await asyncio.sleep(self.sdr_settle)
-                logger.info(f'gathering options for {self.frequencies}')
-                cmd = self.dumphfdl_commandline(self.frequencies)
-                logger.info('starting dumphfdl')
-                logger.debug(f'$ `{" ".join(cmd)}`')
-                self.process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
-                logger.debug(f'process started {self.process}')
-                logger.info('starting packet watcher')
-                self.packet_watcher = PacketWatcher(fifo)
-                self.ground_station_cache.subscribe_to_packet_watcher(self.packet_watcher)
-                self.packet_watcher.start()
-
-                try:
-                    logger.info(f'starting error watcher')
-                    loop.create_task(self.watch_stderr(self.process.stderr))
-                    await self.process.wait()
-                except Exception as e:
-                    logger.error(f'Process aborted: {e}')
-                    sys.exit(1)
-
-                logger.info('dumphfdl process finished')
-                self.process = None
-                self.packet_watcher.stop()
+        except Exception as e:
+            logger.error(f'dumphfdl Listener encountered an error: {e}')
+            sys.exit(1)
 
     def terminate(self):
         if self.process:
