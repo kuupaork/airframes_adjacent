@@ -221,7 +221,7 @@ class GroundStationCache:
             try:
                 self[gs['id']].update_from_airframes(gs, mark_clean)
             except KeyError:
-                log.warning(f'ignoring spurious station `{gs["id"]}')
+                logger.warning(f'ignoring spurious station `{gs["id"]}')
         self.update_lookups()
         self.prune_expired()
         self.save()
