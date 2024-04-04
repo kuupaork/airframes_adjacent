@@ -123,8 +123,12 @@ class GroundStation:
             self.frequencies = data.frequencies
 
     def update_from_airframes(self, data, mark_clean=False):
-        if self.is_new_pseudoframe(data['last_updated']):
-            self.last_updated = data['last_updated']
+        # handle data flagged as reference (a negative value indicates a generic offset from "now")
+        last_updated = data['last_updated']
+        if last_updated < 0:
+            last_updated += datetime.datetime.now().timestamp() 
+        if self.is_new_pseudoframe(last_updated):
+            self.last_updated = last_updated
             self.gsid = data['id']
             self.name = data['name']
             self.frequencies = sorted(data['frequencies']['active'])
@@ -150,9 +154,11 @@ class GroundStation:
 
     def rate_uplink_packet(self, packet):
         self.uplink_packets += 1
+        self.stats[packet.frequency] += 1
 
     def rate_downlink_packet(self, packet):
         self.downlink_packets += 1
+        self.stats[packet.frequency] += 1
 
     def dict(self):
         return {
@@ -177,6 +183,11 @@ class GroundStation:
             f'#{self.gsid}. {self.name} ({",".join(str(f) for f in self.frequencies)})' + 
             f' up:{self.uplink_packets} down:{self.downlink_packets}'
         )
+
+    def statsblock(self, log):
+        log.info(str(self))
+        for f in sorted(self.stats.keys()):
+            log.info(f'    {f}kHz : {self.stats[f]}')
 
 
 class GroundStationCache:
@@ -472,7 +483,7 @@ class GroundStationWatcher:
 
         if EXPERIMENTAL:
             middle_pool = experimental_middle_pool()
-            logger.info("[experimental] middle pool: {list(middle_pool)} (unranked)")
+            logger.info(f'[experimental] middle pool: {list(middle_pool)} (unranked)')
             logger.info('[experimental] iterate-core pools:')
             for pool in experimental_iterate_core():
                 logger.info(f'    {list(pool)}')
@@ -593,17 +604,6 @@ def balancing_iter(sources, targets=None, pivot=None):
         pivot_freq = sources[0]
     # ordered by distance. This is generally fair; it favours same and near band.
     return sorted(sources, key=lambda x: abs(x - pivot_freq))
-
-    # low = list(reversed(sources[0:source_pivot]))
-    # high = sources[source_pivot:]
-    # if not targets:
-    #     zipper = []
-    # elif (pivot % len(targets)) >= len(targets) // 2:
-    #     zipper = itertools.zip_longest(high, low)
-    # else:
-    #     zipper = itertools.zip_longest(low, high)
-    # for next_freqs in zipper:
-    #     yield from next_freqs
 
 
 def ordered_by_distance(data, origin):

@@ -3,7 +3,7 @@
 # squitter-compiled frequency lists are (not) yet compiled.
 import datetime
 
-fake_now = datetime.datetime.now().timestamp() - 3600
+fake_now = - 3600
 
 ALL_FREQUENCIES = {
     "ground_stations": [
