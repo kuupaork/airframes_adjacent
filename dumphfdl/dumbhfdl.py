@@ -94,6 +94,7 @@ class GroundStation:
     last_updated = 0
     frequencies = []
     dirty = False
+    temporary = False
     name = None
     gsid = "unknown"
     uplink_packets = 0
@@ -103,7 +104,7 @@ class GroundStation:
         try:
             self.stats = collections.defaultdict(lambda: 0)
         except Exception as e:
-            logger.error(f'{e}')
+            logger.error('Ground Station init error', exc_info=e)
             raise
 
     def __setattr__(self, name, value):
@@ -111,33 +112,36 @@ class GroundStation:
         super().__setattr__(name, value)
         if name in ('last_updated', 'frequencies', 'name', 'gsid') and value != oldval:
             super().__setattr__('dirty', True)
+            super().__setattr__('temporary', False)
 
     def is_new_pseudoframe(self, timestamp):
         return (self.last_updated // SQUITTER_FRAME_TIME) < (timestamp // SQUITTER_FRAME_TIME)
 
     def update_from_station(self, data):
-        if self.is_new_pseudoframe(data.last_updated):
+        if self.is_new_pseudoframe(data.last_updated) or self.temporary:
             self.last_updated = data.last_updated
             self.gsid = data.gsid
             self.name = data.name
             self.frequencies = data.frequencies
+            self.temporary = data.temporary
 
-    def update_from_airframes(self, data, mark_clean=False):
+    def update_from_airframes(self, data, mark_clean=False, temporary=False):
         # handle data flagged as reference (a negative value indicates a generic offset from "now")
         last_updated = data['last_updated']
         if last_updated < 0:
             last_updated += datetime.datetime.now().timestamp() 
-        if self.is_new_pseudoframe(last_updated):
+        if self.is_new_pseudoframe(last_updated) and (self.temporary or not temporary or not self.last_updated):
             self.last_updated = last_updated
             self.gsid = data['id']
             self.name = data['name']
             self.frequencies = sorted(data['frequencies']['active'])
             logger.debug(f'airframes update for {self}')
-            if mark_clean:
+            self.temporary = temporary
+            if mark_clean or temporary:
                 self.mark_clean()
 
     def update_from_squitter(self, data, last_updated):
-        if self.is_new_pseudoframe(last_updated):
+        if self.temporary or self.is_new_pseudoframe(last_updated):
             self.last_updated = last_updated
             self.gsid = data['gs']['id']
             self.name = data['gs']['name']
@@ -145,7 +149,7 @@ class GroundStation:
             logger.debug(f'squitter update for {self}')
 
     def update_from_hfnpdu(self, data, last_updated):
-        if not self.last_updated:  # packets only used to backfill missing stations.
+        if (self.temporary or not self.last_updated) and data['heard_on_freqs']:  # packets only used to backfill missing stations.
             self.last_updated = last_updated
             self.gsid = data['gs']['id']
             self.name = data['gs']['name']
@@ -161,6 +165,8 @@ class GroundStation:
         self.stats[packet.frequency] += 1
 
     def dict(self):
+        if self.temporary:
+            return None
         return {
             'id': self.gsid,
             'name': self.name,
@@ -228,11 +234,12 @@ class GroundStationCache:
                 del self.stations_by_id[station.gsid]
 
     def merge_airframes(self, airframes, is_load=False, mark_clean=False):
+        temporary = airframes.get('is_temporary', False)
         for gs in airframes.get('ground_stations', []):
             try:
-                self[gs['id']].update_from_airframes(gs, mark_clean)
+                self[gs['id']].update_from_airframes(gs, mark_clean, temporary)
             except KeyError:
-                logger.warning(f'ignoring spurious station `{gs["id"]}')
+                logger.warning(f'ignoring spurious station `{gs["id"]}`')
         self.update_lookups()
         self.prune_expired()
         self.save()
@@ -263,7 +270,8 @@ class GroundStationCache:
         self.save()
 
     def dict(self):
-        return {'ground_stations': list(station.dict() for station in self.stations_by_id.values())}
+        out = list(filter(None, (station.dict() for station in self.stations_by_id.values())))
+        return {'ground_stations': out}
 
     def pruned_dict(self):
         self.prune_expired()
@@ -365,12 +373,12 @@ class GroundStationWatcher:
         for name, source in sources:
             ground_station_data = source()
             parsed = self.parse_airframes(ground_station_data)
-            if all(parsed.frequencies(core_id) for core_id in self.core_ids):
+            self.ground_station_cache.merge(parsed)
+            if all(self.ground_station_cache.frequencies(core_id) for core_id in self.core_ids):
                 logger.info(f'Using {name}')
-                self.ground_station_cache.merge(parsed)
                 return self.choose_best_frequencies()
             else:
-                logger.info(f'Cannot update from {name}')
+                logger.info(f'Station list incomplete after {name}')
         else:
             raise ValueError('No frequency sources are valid')
 
@@ -497,7 +505,7 @@ class HFDLPacketInfo:
         self.packet = packet
         self.timestamp = packet['t']['sec']
         self.frequency = packet['freq'] // 1000
-        self.station = packet['station']
+        self.station = packet.get('station')
         self.bitrate = packet.get('bitrate')
         self.skew = packet.get('freq_skew')
         self.frame_slot = packet.get('slot')
@@ -580,7 +588,7 @@ class PacketWatcher:
                     raise
                 logger.info('packet watcher completed')
         except Exception as e:
-            logger.error(e)
+            logger.error('watching fifo errored out', exc_info=e)
             sys.exit(1)
 
     def default_update(self, update):
@@ -783,14 +791,14 @@ class HFDLListener:
                         loop.create_task(self.watch_stderr(self.process.stderr))
                         await self.process.wait()
                     except Exception as e:
-                        logger.error(f'Process aborted: {e}')
+                        logger.error('Process aborted.', exc_info=e)
                         sys.exit(1)
 
                     logger.info('dumphfdl process finished')
                     self.process = None
                     self.packet_watcher.stop()
         except Exception as e:
-            logger.error(f'dumphfdl Listener encountered an error: {e}')
+            logger.error('dumphfdl Listener encountered an error', exc_info=e)
             sys.exit(1)
 
     def terminate(self):

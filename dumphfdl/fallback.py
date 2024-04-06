@@ -6,6 +6,7 @@ import datetime
 fake_now = - 3600
 
 ALL_FREQUENCIES = {
+    "is_temporary": True,
     "ground_stations": [
         {
             "id": 1,
@@ -13,7 +14,7 @@ ALL_FREQUENCIES = {
             "frequencies": {
                 "active": [21934, 17919, 12276, 11327, 10081, 8927, 6559, 5508]
             },
-            "last_updated": fake_now
+            "last_updated": fake_now,
         },
         {
             "id": 2,
@@ -145,3 +146,10 @@ ALL_FREQUENCIES = {
         }
     ]
 }
+
+# This gets *most* of the way to converting systable.conf to a JSON file. The outstanding issue is the trailing comma
+# in objects.
+# echo '{' > ~/gs.json 
+# cat /usr/local/share/dumphfdl/systable.conf \
+# | sed -e 's/(/[/g' -e s'/)/]/g' -e 's/=/:/g' -e 's/;/,/g' -e 's/^\s*\([a-z]\+\) /"\1"/' >> ~/gs.json
+# echo '}' >> ~/gs.json
