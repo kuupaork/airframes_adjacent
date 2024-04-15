@@ -141,11 +141,12 @@ class GroundStation:
                 self.mark_clean()
 
     def update_from_squitter(self, data, last_updated):
-        if self.temporary or self.is_new_pseudoframe(last_updated):
+        nf = sorted(map(int, (sf['freq'] for sf in data['freqs'])))
+        if self.temporary or self.is_new_pseudoframe(last_updated) or nf != self.frequencies:
             self.last_updated = last_updated
             self.gsid = data['gs']['id']
             self.name = data['gs']['name']
-            self.frequencies = sorted(map(int, (sf['freq'] for sf in data['freqs'])))
+            self.frequencies = nf
             logger.debug(f'squitter update for {self}')
 
     def update_from_hfnpdu(self, data, last_updated):
@@ -350,11 +351,16 @@ class GroundStationWatcher:
     def remote(self, url):
         data = {}
         if url:
-            response = requests.get(url)
             try:
-                data = response.json()
-            except (json.JSONDecodeError, requests.JSONDecodeError):
-                pass
+                response = requests.get(url)
+            except requests.exceptions.ConnectionError as e:
+                logger.error("cannot retrieve URL", exc_info=e)
+            else:
+                try:
+                    data = response.json()
+                except (json.JSONDecodeError, requests.JSONDecodeError):
+                    pass
+
         return data
 
     def parse_airframes(self, data):
@@ -364,8 +370,8 @@ class GroundStationWatcher:
 
     def refresh(self):
         sources = [
-            ('Airframes Ground Station URL', lambda: self.remote(GROUND_STATION_URL)),
             ('Cached Squitter Data', lambda: self.ground_station_cache.pruned_dict()),
+            ('Airframes Ground Station URL', lambda: self.remote(GROUND_STATION_URL)),
             ('Backup Ground Station URL', lambda: self.remote(os.getenv('DUMPHFDL_BACKUP_URL'))),
             ('All Allocated Frequencies', lambda: fallback.ALL_FREQUENCIES),
         ]
@@ -710,6 +716,7 @@ class HFDLListener:
     dumphfdl_task = None
     process = None
     packet_watcher = None
+    recoverable_error_count = 0
 
     def __init__(self, ground_station_cache, sample_rates, **dumphfdl_opts):
         self.ground_station_cache = ground_station_cache
@@ -773,16 +780,18 @@ class HFDLListener:
                     if self.packet_watcher:
                         logger.debug('cleaning up old packet watcher')
                         self.packet_watcher.stop()
-                        logger.info('giving SDR a chance to settle')
-                        await asyncio.sleep(self.sdr_settle)
+                    logger.info('giving SDR a chance to settle')
+                    await asyncio.sleep(self.sdr_settle)
                     logger.info(f'gathering options for {self.frequencies}')
                     cmd = self.dumphfdl_commandline(self.frequencies)
                     logger.info('starting dumphfdl')
                     logger.debug(f'$ `{" ".join(cmd)}`')
+                    self.recoverable_error_count = 0
                     self.process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
                     logger.debug(f'process started {self.process}')
                     logger.info('starting packet watcher')
                     self.packet_watcher = PacketWatcher(fifo)
+                    self.packet_watcher.add_subscriber(True, self.reset_recoverable_error_count)
                     self.ground_station_cache.subscribe_to_packet_watcher(self.packet_watcher)
                     self.packet_watcher.start()
 
@@ -797,14 +806,18 @@ class HFDLListener:
                     logger.info('dumphfdl process finished')
                     self.process = None
                     self.packet_watcher.stop()
+                logger.debug('resources freed')
         except Exception as e:
             logger.error('dumphfdl Listener encountered an error', exc_info=e)
             sys.exit(1)
+        logger.debug('dumphfdl run completed')
 
     def terminate(self):
         if self.process:
             logger.info(f'stopping dumphfdl')
             self.process.terminate()
+        else:
+            logger.debugger('no process, cannot terminate')
 
     def kill(self):
         if self.process:
@@ -812,17 +825,29 @@ class HFDLListener:
             self.killed = True
             self.process.kill()
             self.process = None
+        else:
+            logger.debugger('no process, cannot kill')
+
+    def reset_recoverable_error_count(self, _):
+        self.recoverable_error_count = 0
 
     async def watch_stderr(self, stream):
         errors = ['^Unable to initialize input']  # , '^Sample buffer overrun']
+        recoverable = ['readStream failed: TIMEOUT']
         async for data in stream:
             line = data.decode('utf8').rstrip()
             dumphfdl_logger.info(line)
             if any(re.search(pattern, line) for pattern in errors):
-                logger.warning(f'encountered error: "{line}". Restarting')
+                logger.warning(f'encountered error: "{line}". Restarting {self.process}')
                 # force restart
-                self.kill()
+                self.terminate()
                 break
+            if any(re.search(pattern, line) for pattern in recoverable):
+                self.recoverable_error_count += 1
+                if self.recoverable_error_count > 10:
+                    logger.warning(f'received too many recoverable errors `{line}`. Restarting')
+                    self.terminate()
+                    break
             if not self.process:
                 break
             await asyncio.sleep(0)
