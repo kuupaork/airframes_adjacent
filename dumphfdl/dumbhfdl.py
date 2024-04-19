@@ -45,7 +45,7 @@ FILTER_FACTOR = 0.9
 # The URL to retrieve Ground Station from
 GROUND_STATION_URL = 'https://api.airframes.io/hfdl/ground-stations'
 # How long to cache ground station updates (seconds)
-GS_EXPIRY = 3 * 3600
+GS_EXPIRY = 3600
 #
 # How often (seconds) to update the frequency list (and probably restart dumphfdl)
 # Set with `--watch-interval` on command line or environment variable `DUMPHFDL_WATCH_INTERVAL`)
@@ -233,6 +233,7 @@ class GroundStationCache:
             if not station.is_valid() and station.gsid in self.stations_by_id:
                 logger.info(f'pruning {station}')
                 del self.stations_by_id[station.gsid]
+        self.update_lookups()
 
     def merge_airframes(self, airframes, is_load=False, mark_clean=False):
         temporary = airframes.get('is_temporary', False)
@@ -241,7 +242,6 @@ class GroundStationCache:
                 self[gs['id']].update_from_airframes(gs, mark_clean, temporary)
             except KeyError:
                 logger.warning(f'ignoring spurious station `{gs["id"]}`')
-        self.update_lookups()
         self.prune_expired()
         self.save()
 
@@ -259,14 +259,12 @@ class GroundStationCache:
         logger.debug(f'hfnpdu seen: {self.stats["hfnpdu"]}')
         self.stats['squitter'] += squitters
         logger.debug(f'squitters seen: {self.stats["squitter"]}')
-        self.update_lookups()
         self.prune_expired()
         self.save()
 
     def merge(self, other):
         for gs in other.stations_by_id.values():
             self.stations_by_id[gs.gsid].update_from_station(gs)
-        self.update_lookups()
         self.prune_expired()
         self.save()
 
@@ -320,12 +318,14 @@ class GroundStationWatcher:
     watch_interval = 600
     _max_sample_size = 20000
     _sample_rates = None
+    prefer = 'none'
 
     def __init__(self, ground_station_cache, on_update=None):
         self.ground_station_cache = ground_station_cache
         self.task = None
         self.on_update = on_update
         self.last = []
+        self.set_backup_list(os.getenv('DUMPHFDL_BACKUP_URL'))
 
     def set_ignore_ranges(self, data):
         if data.startswith('['):
@@ -340,6 +340,9 @@ class GroundStationWatcher:
         else:
             raise ValueError(f'unsupported ignored ranges {data}')
 
+    def set_prefer(self, prefer):
+        self.prefer = prefer or 'none'
+
     async def run(self):
         while True:
             logger.info("refreshing")
@@ -351,15 +354,21 @@ class GroundStationWatcher:
     def remote(self, url):
         data = {}
         if url:
-            try:
-                response = requests.get(url)
-            except requests.exceptions.ConnectionError as e:
-                logger.error("cannot retrieve URL", exc_info=e)
-            else:
+            if url.startswith('/'):
                 try:
-                    data = response.json()
+                    data = json.loads(pathlib.Path(url).read_bytes())
                 except (json.JSONDecodeError, requests.JSONDecodeError):
                     pass
+            else:
+                try:
+                    response = requests.get(url)
+                except requests.exceptions.ConnectionError as e:
+                    logger.error("cannot retrieve URL", exc_info=e)
+                else:
+                    try:
+                        data = response.json()
+                    except (json.JSONDecodeError, requests.JSONDecodeError):
+                        pass
 
         return data
 
@@ -368,13 +377,28 @@ class GroundStationWatcher:
         stations.merge_airframes(data)
         return stations
 
+    def set_backup_list(self, backups):
+        if isinstance(backups, list):
+            self.backup_urls = backups
+        if backups.startswith('['):
+            self.backup_urls = json.loads(backups)
+        else:
+            self.backup_urls = [backups]
+
     def refresh(self):
         sources = [
             ('Cached Squitter Data', lambda: self.ground_station_cache.pruned_dict()),
             ('Airframes Ground Station URL', lambda: self.remote(GROUND_STATION_URL)),
-            ('Backup Ground Station URL', lambda: self.remote(os.getenv('DUMPHFDL_BACKUP_URL'))),
-            ('All Allocated Frequencies', lambda: fallback.ALL_FREQUENCIES),
         ]
+        # ('Backup Ground Station URL', lambda: self.remote(os.getenv('DUMPHFDL_BACKUP_URL'))),
+        def get(url):
+            return lambda: self.remote(url)
+        for backup in self.backup_urls:
+            sources.append((f'Backup URL: {backup}', get(backup)))
+        sources.append(('All Allocated Frequencies', lambda: fallback.ALL_FREQUENCIES))
+
+        self.ground_station_cache.prune_expired()
+
         logger.info('refreshing ground station data')
         for name, source in sources:
             ground_station_data = source()
@@ -453,7 +477,12 @@ class GroundStationWatcher:
         high_pool = self.create_pool()
         high_pool.add_stations(core_stations, pivot=-1)
         high = list(high_pool)
-        actual_pool = high_pool if len(high_pool) > len(low_pool) else low_pool
+        if self.prefer == "high":
+            actual_pool = high_pool
+        elif self.prefer == "low":
+            actual_pool = low_pool
+        else:
+            actual_pool = high_pool if len(high_pool) > len(low_pool) else low_pool
         logger.debug(f"low pool: {low}")
         logger.debug(f"high pool: {high}")
 
@@ -738,6 +767,8 @@ class HFDLListener:
             ('system_table', 'system-table'),
             ('system_table_save', 'system-table-save'),
             ('station_id', 'station-id'),
+            ('freq_offset', 'freq-offset'),
+            ('freq_correction', 'freq-correction'),
         ]
         for from_opt, to_opt in opt_map:
             value = self.dumphfdl_opts.get(from_opt, None)
@@ -826,7 +857,7 @@ class HFDLListener:
             self.process.kill()
             self.process = None
         else:
-            logger.debugger('no process, cannot kill')
+            logger.debug('no process, cannot kill')
 
     def reset_recoverable_error_count(self, _):
         self.recoverable_error_count = 0
@@ -885,6 +916,7 @@ def common_params(func):
     @click.option('--skip-fill', is_flag=True)
     @click.option('--max-samples', type=int, default=os.getenv('DUMPHFDL_MAX_SAMPLES', MAXIMUM_SAMPLE_SIZE))
     @click.option('--ignore-ranges', default=os.getenv('DUMPHFDL_IGNORE_RANGES', []))
+    @click.option('--prefer', help='pool to prefer ("high", "low", or "none")', default=os.getenv('DUMPHFDL_PREFERENCE', 'none'))
     @click.option('--gs-cache', help='Airframes Station Data path', default=os.getenv('DUMPHFDL_AIRFRAMES_CACHE'))
     @click.option('--sample-rates', help='the sample sizes supported by your radio', default=os.getenv('DUMPHFDL_SAMPLE_RATES', ''))
     @functools.wraps(func)
@@ -918,7 +950,9 @@ def main(ctx):
 )
 @click.option('--gain', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_GAIN'))
 @click.option('--gain-elements', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_GAIN_ELEMENTS'))
-def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, sample_rates,
+@click.option('--freq-offset', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_FREQ_OFFSET'))
+@click.option('--freq-correction', help='(see dumphfdl)', default=os.getenv('DUMPHFDL_FREQ_CORRECTION'))
+def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, prefer, gs_cache, sample_rates,
         statsd, quiet, log_path, watch_interval, sdr_settle,acars_hub,
         **dumphfdl_opts
     ):
@@ -944,6 +978,7 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, s
     watcher.max_sample_size = max_samples
     watcher.sample_rates = sample_rates
     watcher.set_ignore_ranges(ignore_ranges)
+    watcher.set_prefer(prefer)
 
     try:
         loop.run_until_complete(watcher.run())
@@ -962,7 +997,7 @@ def run(core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, s
 @click.option('--named', help='Build pool from Core and Fringe stations only', is_flag=True)
 @click.option('--experiments', help='show other possible pools based on experimental strategies.', is_flag=True)
 def scan(
-        core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, gs_cache, sample_rates,
+        core_ids, fringe_ids, skip_fill, max_samples, ignore_ranges, prefer, gs_cache, sample_rates,
         core, named, experiments
     ):
     global FRINGE_STATIONS, FILL_OTHER_STATIONS, EXPERIMENTAL
@@ -981,6 +1016,7 @@ def scan(
     watcher.max_sample_size = max_samples
     watcher.sample_rates = sample_rates
     watcher.set_ignore_ranges(ignore_ranges)
+    watcher.set_prefer(prefer)
     assert watcher.core_ids, 'No core stations identified'
     logger.debug(f'core ids = {core_ids} / {watcher.core_ids}')
 
