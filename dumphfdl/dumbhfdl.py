@@ -124,6 +124,7 @@ class GroundStation:
             self.name = data.name
             self.frequencies = data.frequencies
             self.temporary = data.temporary
+            logger.debug(f'station object update {self}')
 
     def update_from_airframes(self, data, mark_clean=False, temporary=False):
         # handle data flagged as reference (a negative value indicates a generic offset from "now")
@@ -135,7 +136,7 @@ class GroundStation:
             self.gsid = data['id']
             self.name = data['name']
             self.frequencies = sorted(data['frequencies']['active'])
-            logger.debug(f'airframes update for {self}')
+            # logger.debug(f'airframes update for {self}')
             self.temporary = temporary
             if mark_clean or temporary:
                 self.mark_clean()
@@ -187,7 +188,7 @@ class GroundStation:
 
     def __str__(self):
         return (
-            f'#{self.gsid}. {self.name} ({",".join(str(f) for f in self.frequencies)})' + 
+            f'#{self.gsid}. {self.name} ({",".join(str(f) for f in self.frequencies)}) @ {int(self.last_updated)}' + 
             f' up:{self.uplink_packets} down:{self.downlink_packets}'
         )
 
@@ -310,6 +311,11 @@ class GroundStationCache:
         if packet.is_downlink:
             self[packet.dst['id']].rate_downlink_packet(packet)
 
+    def __str__(self):
+        out = []
+        for s in self.stations_by_id.values():
+            out.append(f'    {s}')
+        return '\n'.join(out)
 
 class GroundStationWatcher:
     core_ids = []
@@ -354,21 +360,22 @@ class GroundStationWatcher:
     def remote(self, url):
         data = {}
         if url:
+            logger.debug(f'retrieving {url}')
             if url.startswith('/'):
                 try:
                     data = json.loads(pathlib.Path(url).read_bytes())
                 except (json.JSONDecodeError, requests.JSONDecodeError):
-                    pass
+                    logger.warning(f'ignoring bad JSON file')
             else:
                 try:
                     response = requests.get(url)
                 except requests.exceptions.ConnectionError as e:
-                    logger.error("cannot retrieve URL", exc_info=e)
+                    logger.error("cannot retrieve URL. Ignoring.", exc_info=e)
                 else:
                     try:
                         data = response.json()
                     except (json.JSONDecodeError, requests.JSONDecodeError):
-                        pass
+                        logger.warning(f'ignoring bad JSON response')
 
         return data
 
@@ -382,8 +389,11 @@ class GroundStationWatcher:
             self.backup_urls = backups
         if backups.startswith('['):
             self.backup_urls = json.loads(backups)
-        else:
+        elif backups:
             self.backup_urls = [backups]
+        else:
+            self.backup_urls = []
+        logger.debug(f'backup sources set to {self.backup_urls}')
 
     def refresh(self):
         sources = [
@@ -404,12 +414,11 @@ class GroundStationWatcher:
             ground_station_data = source()
             parsed = self.parse_airframes(ground_station_data)
             self.ground_station_cache.merge(parsed)
-            if all(self.ground_station_cache.frequencies(core_id) for core_id in self.core_ids):
-                logger.info(f'Using {name}')
-                return self.choose_best_frequencies()
-            else:
-                logger.info(f'Station list incomplete after {name}')
+        logger.debug(f'Ground station cache:\n{self.ground_station_cache}')
+        if all(self.ground_station_cache.frequencies(core_id) for core_id in self.core_ids):
+            return self.choose_best_frequencies()
         else:
+            logger.info(f'Station list incomplete after all updates')
             raise ValueError('No frequency sources are valid')
 
     def reconcile_samples(self):
