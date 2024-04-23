@@ -45,7 +45,7 @@ FILTER_FACTOR = 0.9
 # The URL to retrieve Ground Station from
 GROUND_STATION_URL = 'https://api.airframes.io/hfdl/ground-stations'
 # How long to cache ground station updates (seconds)
-GS_EXPIRY = 3600
+GS_EXPIRY = 2*3600
 #
 # How often (seconds) to update the frequency list (and probably restart dumphfdl)
 # Set with `--watch-interval` on command line or environment variable `DUMPHFDL_WATCH_INTERVAL`)
