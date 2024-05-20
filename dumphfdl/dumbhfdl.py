@@ -75,10 +75,10 @@ DUMB_SHARE_PATH = pathlib.Path.home() / '.local/share/dumbhfdl/'
 # Can be set using `--system_table` option on command line or the `DUMPHFDL_SYSTABLE` environment variable
 SYSTABLE_LOCATION = '/usr/local/share/dumphfdl/systable.conf'
 # The location where an updated systable.conf will be written. If None, no updates will be saved.
-# Can be set using `--system_table-save` option on command line 
+# Can be set using `--system_table-save` option on command line
 # or the `DUMPHFDL_SYSTABLE_UPDATES` environment variable
 SYSTABLE_UPDATES_PATH = f'{DUMB_SHARE_PATH}/hfdl-systable-new.conf'
-# The default location where logs will be written. If None, no packet logs will be kept. 
+# The default location where logs will be written. If None, no packet logs will be kept.
 # Override with `--log-path` option or the `DUMPHFDL_LOG_PATH` environment variable.
 LOG_PATH = DUMB_SHARE_PATH / "logs"
 
@@ -130,7 +130,7 @@ class GroundStation:
         # handle data flagged as reference (a negative value indicates a generic offset from "now")
         last_updated = data['last_updated']
         if last_updated < 0:
-            last_updated += datetime.datetime.now().timestamp() 
+            last_updated += datetime.datetime.now(datetime.timezone.utc).timestamp()
         if self.is_new_pseudoframe(last_updated) and (self.temporary or not temporary or not self.last_updated):
             self.last_updated = last_updated
             self.gsid = data['id']
@@ -176,19 +176,20 @@ class GroundStation:
                 'active': self.frequencies,
             },
             'last_updated': self.last_updated,
+            'when': datetime.datetime.utcfromtimestamp(self.last_updated).isoformat() + 'Z',
         }
 
     def mark_clean(self):
         self.dirty = False
 
     def is_valid(self):
-        now = datetime.datetime.now().timestamp()
+        now = datetime.datetime.now(datetime.timezone.utc).timestamp()
         horizon = now - GS_EXPIRY
         return self.last_updated >= horizon and self.frequencies
 
     def __str__(self):
         return (
-            f'#{self.gsid}. {self.name} ({",".join(str(f) for f in self.frequencies)}) @ {int(self.last_updated)}' + 
+            f'#{self.gsid}. {self.name} ({",".join(str(f) for f in self.frequencies)}) @ {int(self.last_updated)}' +
             f' up:{self.uplink_packets} down:{self.downlink_packets}'
         )
 
@@ -219,11 +220,13 @@ class GroundStationCache:
 
     def save(self):
         if self.path:
-            current = json.dumps(self.dict(), indent=4)
-            if current != self.last:  # very naive
-                logger.info('saving station cache')
+            current_dict = self.dict()
+            if current_dict != self.last:  # very naive
+                self.last = current_dict
+                current = json.dumps(self.dict(), indent=4)
+                current = f'{{ "when" : "{datetime.datetime.now(datetime.timezone.utc).isoformat()}Z", {current[1:]}'
                 self.path.write_text(current)
-                self.last = current
+                logger.info('saved station cache')
                 map(lambda that: that.mark_clean(), self.stations)
 
     def update_lookups(self):
@@ -271,7 +274,9 @@ class GroundStationCache:
 
     def dict(self):
         out = list(filter(None, (station.dict() for station in self.stations_by_id.values())))
-        return {'ground_stations': out}
+        return {
+            'ground_stations': out,
+        }
 
     def pruned_dict(self):
         self.prune_expired()
@@ -345,6 +350,7 @@ class GroundStationWatcher:
             self.ignore_ranges = []
         else:
             raise ValueError(f'unsupported ignored ranges {data}')
+        logger.debug(f'ranges ignored: {self.ignore_ranges}')
 
     def set_prefer(self, prefer):
         self.prefer = prefer or 'none'
@@ -373,7 +379,8 @@ class GroundStationWatcher:
                     logger.error("cannot retrieve URL. Ignoring.", exc_info=e)
                 else:
                     try:
-                        data = response.json()
+                        txt = response.text
+                        data = json.loads(txt)
                     except (json.JSONDecodeError, requests.JSONDecodeError):
                         logger.warning(f'ignoring bad JSON response')
 
@@ -418,7 +425,12 @@ class GroundStationWatcher:
         if all(self.ground_station_cache.frequencies(core_id) for core_id in self.core_ids):
             return self.choose_best_frequencies()
         else:
-            logger.info(f'Station list incomplete after all updates')
+            logger.info(f'Station list incomplete after all updates.')
+            logger.debug('Core Stations:')
+            for core_id in self.core_ids:
+                freqs = self.ground_station_cache.frequencies(core_id)
+                missing = ' ' if freqs else '*'
+                logger.debug(f'  {missing} {core_id} = {freqs}')
             raise ValueError('No frequency sources are valid')
 
     def reconcile_samples(self):
@@ -472,7 +484,7 @@ class GroundStationWatcher:
         5. Finally, any other stations' active frequencies may then be added. (Can be disabled)
 
         This mechanism has a few caveats:
-        - 21 MHz is somewhat selected against, as its distance from other bands reduces the other bands that may 
+        - 21 MHz is somewhat selected against, as its distance from other bands reduces the other bands that may
           also be covered.
         - If low frequency bands are considered, they may skew against the middle bands (10, 11, 13MHz). At my station,
           there's a lot of noise and not much signal below 6MHz, so I've marked that range as ignored and it works well
@@ -659,7 +671,7 @@ def balancing_iter(sources, targets=None, pivot=None):
 
 
 def ordered_by_distance(data, origin):
-    return 
+    return
 
 
 class FrequencyPool:
@@ -793,7 +805,7 @@ class HFDLListener:
         if self.acars_hub:
             host, port = self.acars_hub.split(':')
             dump_cmd.extend(['--output', f'decoded:json:tcp:address={host},port={port}'])
-        elif self.dumphfdl_opts.get('station_id'):
+        elif self.dumphfdl_opts.get('station_id') and not self.dumphfdl_opts.get('station_id').startswith('*'):
             dump_cmd.extend(['--output', 'decoded:json:tcp:address=feed.airframes.io,port=5556',])
         if self.log_path:
             dump_cmd.extend(['--output', f'decoded:json:file:path={self.log_path}/hfdl.json.log,rotate=daily',])
@@ -1042,4 +1054,3 @@ def scan(
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     main()
- 
